@@ -1,0 +1,25 @@
+{
+  "name": "sbhub-tournament-updater",
+  "version": "1.0.0",
+  "description": "Node.js version of the tournament data update system for SoccerBattleHub",
+  "main": "update-node.js",
+  "scripts": {
+    "start": "node update-node.js",
+    "dev": "nodemon update-node.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.0.0",
+    "node-fetch": "^2.7.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "keywords": [
+    "firebase",
+    "tournament",
+    "soccer",
+    "api"
+  ],
+  "author": "SoccerBattleHub",
+  "license": "MIT"
+}

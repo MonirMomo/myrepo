@@ -1,0 +1,26 @@
+name: Update Tournament Data
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # Every 30 minutes
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      - run: npm install
+      - name: Create serviceAccountKey.json from secret
+        run: echo "$SERVICE_ACCOUNT_KEY" > serviceAccountKey.json
+        env:
+          SERVICE_ACCOUNT_KEY: ${{ secrets.SERVICE_ACCOUNT_KEY }}
+      - name: Run tournament update
+        run: npm start
+        env:
+          API_ACCESS_TOKEN: ${{ secrets.API_ACCESS_TOKEN }}
+          API_APP_ID: ${{ secrets.API_APP_ID }}
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          TOURNAMENTS_DAYS: ${{ secrets.TOURNAMENTS_DAYS }}
