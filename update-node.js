@@ -1,4 +1,4 @@
-/**
+API_CONFIG/**
  * Tournament Data Update System - Node.js Version
  * Fetches tournament data from external API and updates Firebase database
  * with player and club statistics, points, and tournament results
@@ -8,14 +8,84 @@ const admin = require('firebase-admin');
 const fetch = require('node-fetch');
 
 // Firebase Admin Configuration
-const serviceAccount = require('./serviceAccountKey.json'); // You'll need to add this file
+// Default service account for the default project. Keep this file local and out of version control.
+const path = require('path');
+const fs = require('fs');
+const defaultServiceAccountPath = path.resolve(__dirname, 'serviceAccountKey.json');
+if (!fs.existsSync(defaultServiceAccountPath)) {
+    console.error('Missing serviceAccountKey.json next to update-node.js. Place the default project service account JSON there.');
+    process.exit(1);
+}
+const serviceAccount = require(defaultServiceAccountPath);
 
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
     databaseURL: "https://soccerbattlehub-default-rtdb.firebaseio.com"
 });
 
-const database = admin.database();
+// Hold a mutable database reference so we can switch if a different DB URL is configured
+let database = admin.database();
+const defaultDatabase = database; // explicitly keep a handle to the default DB
+
+/**
+ * Dynamically switch the Firebase Admin DB to a configured URL if present
+ * Reads config/databaseURL from the DEFAULT database, and if it differs, initializes
+ * a second Admin app pointing at that database and switches the global `database` ref.
+ */
+async function initializeDynamicDatabase() {
+    try {
+        // Read from the default DB only
+        const [urlSnap, saPathSnap] = await Promise.all([
+            defaultDatabase.ref('config/databaseURL').once('value'),
+            defaultDatabase.ref('config/serviceAccountKeyPath').once('value')
+        ]);
+        const configuredUrl = urlSnap.val();
+        const alternateSaPath = saPathSnap.val();
+        const defaultUrl = 'https://soccerbattlehub-default-rtdb.firebaseio.com';
+
+        if (configuredUrl && typeof configuredUrl === 'string' && configuredUrl !== defaultUrl) {
+            // Initialize or reuse a named app for the configured DB
+            let targetApp;
+            try {
+                targetApp = admin.app('dynamicDatabase');
+            } catch {
+                // If switching to a different project, allow specifying a different service account JSON path
+                let credentialToUse = admin.credential.cert(serviceAccount);
+                if (alternateSaPath && typeof alternateSaPath === 'string') {
+                    try {
+                        const resolved = path.isAbsolute(alternateSaPath)
+                            ? alternateSaPath
+                            : path.resolve(process.cwd(), alternateSaPath);
+                        if (fs.existsSync(resolved)) {
+                            const altSa = require(resolved);
+                            credentialToUse = admin.credential.cert(altSa);
+                            console.log(`Using alternate service account at ${resolved} for ${configuredUrl}`);
+                        } else {
+                            console.warn(`Alternate service account path not found: ${resolved}. Falling back to default credentials.`);
+                        }
+                    } catch (e) {
+                        console.warn(`Failed to load alternate service account: ${e.message}. Falling back to default credentials.`);
+                    }
+                }
+
+                targetApp = admin.initializeApp({
+                    credential: credentialToUse,
+                    databaseURL: configuredUrl
+                }, 'dynamicDatabase');
+            }
+
+            database = targetApp.database();
+            console.log(`Using configured database: ${configuredUrl}`);
+        } else {
+            database = defaultDatabase;
+            console.log(`Using default database: ${defaultUrl}`);
+        }
+    } catch (err) {
+        // On any error, fall back to default DB
+        database = defaultDatabase;
+        console.warn(`Dynamic database check failed, using default DB. Reason: ${err.message}`);
+    }
+}
 
 // API Configuration - Using environment variables for security
 const API_CONFIG = {
@@ -103,6 +173,8 @@ async function fetchClubsAndPlayers() {
  */
 async function initializeTournamentFetcher() {
     try {
+    // Pick the correct database before any reads/writes
+    await initializeDynamicDatabase();
         // Load current season first
         await loadCurrentSeason();
         console.log(`Starting tournament fetcher for Season ${currentSeason}...`);
