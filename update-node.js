@@ -1,4 +1,4 @@
-API_CONFIG/**
+/**
  * Tournament Data Update System - Node.js Version
  * Fetches tournament data from external API and updates Firebase database
  * with player and club statistics, points, and tournament results
@@ -35,12 +35,14 @@ const defaultDatabase = database; // explicitly keep a handle to the default DB
 async function initializeDynamicDatabase() {
     try {
         // Read from the default DB only
-        const [urlSnap, saPathSnap] = await Promise.all([
+        const [urlSnap, saPathSnap, saJsonSnap] = await Promise.all([
             defaultDatabase.ref('config/databaseURL').once('value'),
-            defaultDatabase.ref('config/serviceAccountKeyPath').once('value')
+            defaultDatabase.ref('config/serviceAccountKeyPath').once('value'),
+            defaultDatabase.ref('config/serviceAccountKeyJson').once('value')
         ]);
         const configuredUrl = urlSnap.val();
         const alternateSaPath = saPathSnap.val();
+        const inlineSaJson = saJsonSnap.val();
         const defaultUrl = 'https://soccerbattlehub-default-rtdb.firebaseio.com';
 
         if (configuredUrl && typeof configuredUrl === 'string' && configuredUrl !== defaultUrl) {
@@ -49,9 +51,28 @@ async function initializeDynamicDatabase() {
             try {
                 targetApp = admin.app('dynamicDatabase');
             } catch {
-                // If switching to a different project, allow specifying a different service account JSON path
+                // If switching to a different project, allow specifying a different service account via JSON or file path
                 let credentialToUse = admin.credential.cert(serviceAccount);
-                if (alternateSaPath && typeof alternateSaPath === 'string') {
+                let usedAlternateCredential = false;
+
+                // Priority 1: Inline JSON from config
+                if (inlineSaJson) {
+                    try {
+                        const obj = (typeof inlineSaJson === 'string') ? JSON.parse(inlineSaJson) : inlineSaJson;
+                        if (obj && obj.client_email && obj.private_key) {
+                            credentialToUse = admin.credential.cert(obj);
+                            console.log(`Using inline service account JSON from config for ${configuredUrl}`);
+                            usedAlternateCredential = true;
+                        } else {
+                            console.warn('Inline service account JSON missing required fields (client_email/private_key).');
+                        }
+                    } catch (e) {
+                        console.warn(`Failed to parse inline service account JSON: ${e.message}.`);
+                    }
+                }
+
+                // Priority 2: File path
+                if (!usedAlternateCredential && alternateSaPath && typeof alternateSaPath === 'string') {
                     try {
                         const resolved = path.isAbsolute(alternateSaPath)
                             ? alternateSaPath
@@ -60,11 +81,12 @@ async function initializeDynamicDatabase() {
                             const altSa = require(resolved);
                             credentialToUse = admin.credential.cert(altSa);
                             console.log(`Using alternate service account at ${resolved} for ${configuredUrl}`);
+                            usedAlternateCredential = true;
                         } else {
-                            console.warn(`Alternate service account path not found: ${resolved}. Falling back to default credentials.`);
+                            console.warn(`Alternate service account path not found: ${resolved}.`);
                         }
                     } catch (e) {
-                        console.warn(`Failed to load alternate service account: ${e.message}. Falling back to default credentials.`);
+                        console.warn(`Failed to load alternate service account from path: ${e.message}.`);
                     }
                 }
 
