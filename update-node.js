@@ -15,7 +15,46 @@ admin.initializeApp({
     databaseURL: "https://soccerbattlehub-default-rtdb.firebaseio.com"
 });
 
-const database = admin.database();
+// Hold a mutable database reference so we can switch if a different DB URL is configured
+let database = admin.database();
+const defaultDatabase = database; // explicitly keep a handle to the default DB
+
+/**
+ * Dynamically switch the Firebase Admin DB to a configured URL if present
+ * Reads config/databaseURL from the DEFAULT database, and if it differs, initializes
+ * a second Admin app pointing at that database and switches the global `database` ref.
+ */
+async function initializeDynamicDatabase() {
+    try {
+        // Read from the default DB only
+        const configSnapshot = await defaultDatabase.ref('config/databaseURL').once('value');
+        const configuredUrl = configSnapshot.val();
+        const defaultUrl = 'https://soccerbattlehub-default-rtdb.firebaseio.com';
+
+        if (configuredUrl && typeof configuredUrl === 'string' && configuredUrl !== defaultUrl) {
+            // Initialize or reuse a named app for the configured DB
+            let targetApp;
+            try {
+                targetApp = admin.app('dynamicDatabase');
+            } catch {
+                targetApp = admin.initializeApp({
+                    credential: admin.credential.cert(serviceAccount),
+                    databaseURL: configuredUrl
+                }, 'dynamicDatabase');
+            }
+
+            database = targetApp.database();
+            console.log(`Using configured database: ${configuredUrl}`);
+        } else {
+            database = defaultDatabase;
+            console.log(`Using default database: ${defaultUrl}`);
+        }
+    } catch (err) {
+        // On any error, fall back to default DB
+        database = defaultDatabase;
+        console.warn(`Dynamic database check failed, using default DB. Reason: ${err.message}`);
+    }
+}
 
 // API Configuration - Using environment variables for security
 const API_CONFIG = {
@@ -103,6 +142,8 @@ async function fetchClubsAndPlayers() {
  */
 async function initializeTournamentFetcher() {
     try {
+    // Pick the correct database before any reads/writes
+    await initializeDynamicDatabase();
         // Load current season first
         await loadCurrentSeason();
         console.log(`Starting tournament fetcher for Season ${currentSeason}...`);
