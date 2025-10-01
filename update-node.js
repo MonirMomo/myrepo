@@ -295,11 +295,8 @@ function getTierFromName(name) {
     const normalizedName = name.toLowerCase();
     
     // Silver tier tournaments (most specific first)
-    if (normalizedName.includes('silver') && normalizedName.includes('singapore') && normalizedName.includes('1')) {
+    if (normalizedName.includes('silver') && normalizedName.includes('singapore')) {
         return 'silverAsia1';
-    }
-    if (normalizedName.includes('silver') && normalizedName.includes('singapore') && normalizedName.includes('2')) {
-        return 'silverAsia2';
     }
     if (normalizedName.includes('silver') && normalizedName.includes('eu') && normalizedName.includes('1')) {
         return 'silverEu1';
@@ -612,8 +609,7 @@ function getPointsMapping(tier) {
         asia: [1.2, 0.6, 0.3, 0.3],
         america: [2, 1, 0.5, 0.5],
         silverUs2: [1.2, 0.6, 0, 0],
-        silverAsia2: [1.2, 0.6, 0, 0],
-        silverAsia1: [1, 0.5, 0, 0],
+        silverAsia1: [1.8, 0.9, 0.4, 0.4],
         roundMadnessEu: [10, 5, 2.5, 1.7],
         roundMadnessUs: [7, 3.5, 1.7, 1.2],
         roundMadnessIndia: [6.4, 3.2, 1.6, 1.1],
