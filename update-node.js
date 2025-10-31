@@ -315,6 +315,9 @@ function getTierFromName(name) {
     if (normalizedName.includes('gold') && normalizedName.includes('limited')) {
         return 'goldLimited';
     }
+    if (normalizedName.includes('halloween')) {
+        return 'halloweenCup';
+    }
     if (normalizedName.includes('asia cup')) {
         return 'asia';
     }
@@ -613,6 +616,7 @@ function getPointsMapping(tier) {
         roundMadnessEu: [10, 5, 2.5, 1.7],
         roundMadnessUs: [7, 3.5, 1.7, 1.2],
         roundMadnessIndia: [6.4, 3.2, 1.6, 1.1],
+        halloweenCup: [10, 5, 2.5, 2.5],
         Unknown: [0, 0, 0, 0]
     };
     
