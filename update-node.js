@@ -745,6 +745,9 @@ async function updateClubPoints(clubName, points) {
                 
                 await clubRef.update(updates);
                 
+                // Update clubs_summary with new total points
+                await database.ref(`clubs_summary/${clubId}/totalPoints`).set(currentTotalPoints + points);
+                
                 console.log(`Updated ${clubName} points: +${points} (season ${currentSeason}: ${currentSeasonPoints + points}, total: ${currentTotalPoints + points})`);
                 return;
             }
