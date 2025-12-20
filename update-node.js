@@ -268,22 +268,34 @@ async function syncPlayFabPlayerData() {
         const clubSnapshot = await database.ref('clubs').once('value');
         const clubs = clubSnapshot.val() || {};
         
-        let totalPlayers = 0;
         let updatedPlayers = 0;
         let failedPlayers = 0;
         const updates = {};
 
-        // Collect all players from all clubs
+        // Collect all players from all clubs into a flat array for batch processing
+        const allPlayers = [];
         for (const [clubId, clubData] of Object.entries(clubs)) {
             if (!clubData.players) continue;
-
             for (const [playerKey, playerData] of Object.entries(clubData.players)) {
                 if (!playerData.playfabId) continue;
-                
-                totalPlayers++;
-                const normalizedId = playerData.playfabId.toUpperCase().replace(/\s/g, '');
-                
-                try {
+                allPlayers.push({ clubId, playerKey, playerData });
+            }
+        }
+        
+        const totalPlayers = allPlayers.length;
+        console.log(`  Found ${totalPlayers} players to sync...`);
+        
+        // Process players in parallel batches for speed
+        const BATCH_SIZE = 10; // Process 10 players at a time
+        
+        for (let i = 0; i < allPlayers.length; i += BATCH_SIZE) {
+            const batch = allPlayers.slice(i, i + BATCH_SIZE);
+            
+            // Process batch in parallel
+            const batchResults = await Promise.allSettled(
+                batch.map(async ({ clubId, playerKey, playerData }) => {
+                    const normalizedId = playerData.playfabId.toUpperCase().replace(/\s/g, '');
+                    
                     // Fetch profile and statistics in parallel
                     const [profile, statistics] = await Promise.all([
                         getPlayFabPlayerProfile(normalizedId),
@@ -308,8 +320,17 @@ async function syncPlayFabPlayerData() {
                         }
                     }
 
+                    return { clubId, playerKey, playerData, normalizedId, playerUpdates, hasUpdates };
+                })
+            );
+            
+            // Process batch results
+            for (const result of batchResults) {
+                if (result.status === 'fulfilled') {
+                    const { clubId, playerKey, playerData, normalizedId, playerUpdates, hasUpdates } = result.value;
+                    
                     if (hasUpdates) {
-                        // Queue updates for club player data (just trophyCount, no season-specific here)
+                        // Queue updates for club player data
                         updates[`clubs/${clubId}/players/${playerKey}`] = {
                             ...playerData,
                             ...playerUpdates,
@@ -328,14 +349,15 @@ async function syncPlayFabPlayerData() {
                         updatedPlayers++;
                         console.log(`  ✓ ${normalizedId}: ${playerUpdates.name ? `name="${playerUpdates.name}"` : ''} ${playerUpdates.trophyCount !== undefined ? `trophies=${playerUpdates.trophyCount}` : ''}`);
                     }
-
-                    // Small delay to avoid rate limiting
-                    await new Promise(resolve => setTimeout(resolve, 100));
-
-                } catch (error) {
-                    console.error(`  ✗ Failed to sync ${normalizedId}: ${error.message}`);
+                } else {
+                    console.error(`  ✗ Failed to sync player: ${result.reason?.message || 'Unknown error'}`);
                     failedPlayers++;
                 }
+            }
+            
+            // Small delay between batches to avoid rate limiting (not between each player)
+            if (i + BATCH_SIZE < allPlayers.length) {
+                await new Promise(resolve => setTimeout(resolve, 200));
             }
         }
 
@@ -373,18 +395,25 @@ async function syncPlayFabPlayerData() {
                 clubTotalTrophies += playerData.trophyCount || 0;
             }
             
-            // Only update if different from current value
+            // Get current values
             const currentClubTrophies = clubData.totalTrophies || 0;
             const currentSeasonTrophies = clubData.seasons?.[currentSeason]?.totalTrophies || 0;
             
-            if (clubTotalTrophies !== currentClubTrophies || clubTotalTrophies !== currentSeasonTrophies) {
-                // Update overall totalTrophies (current season trophies)
+            // Check what actually needs updating
+            const needsRootUpdate = clubTotalTrophies !== currentClubTrophies;
+            const needsSeasonUpdate = clubTotalTrophies !== currentSeasonTrophies;
+            
+            if (needsRootUpdate || needsSeasonUpdate) {
+                // Always write to all paths to keep them in sync
                 clubTrophyUpdates[`clubs/${clubId}/totalTrophies`] = clubTotalTrophies;
                 clubTrophyUpdates[`clubs_summary/${clubId}/totalTrophies`] = clubTotalTrophies;
-                // Also update season-specific totalTrophies
                 clubTrophyUpdates[`clubs/${clubId}/seasons/${currentSeason}/totalTrophies`] = clubTotalTrophies;
-                console.log(`  ✓ ${clubData.name}: ${currentClubTrophies} → ${clubTotalTrophies} trophies (season ${currentSeason})`);
-                clubsUpdated++;
+                
+                // Only log if the actual trophy count changed (not just syncing season path)
+                if (needsRootUpdate) {
+                    console.log(`  ✓ ${clubData.name}: ${currentClubTrophies} → ${clubTotalTrophies} trophies (season ${currentSeason})`);
+                    clubsUpdated++;
+                }
             }
         }
         
