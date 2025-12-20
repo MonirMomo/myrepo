@@ -287,7 +287,7 @@ async function syncPlayFabPlayerData() {
                     // Fetch profile and statistics in parallel
                     const [profile, statistics] = await Promise.all([
                         getPlayFabPlayerProfile(normalizedId),
-                        getPlayFabPlayerStatistics(normalizedId, ['Trophies'])
+                        getPlayFabPlayerStatistics(normalizedId, ['NUM_TROPHIES_SEASON'])
                     ]);
 
                     let hasUpdates = false;
@@ -299,9 +299,9 @@ async function syncPlayFabPlayerData() {
                         hasUpdates = true;
                     }
 
-                    // Update trophy count if available
-                    if (statistics?.Trophies !== undefined) {
-                        const newTrophyCount = statistics.Trophies;
+                    // Update trophy count if available (statistic is named NUM_TROPHIES_SEASON in PlayFab)
+                    if (statistics?.NUM_TROPHIES_SEASON !== undefined) {
+                        const newTrophyCount = statistics.NUM_TROPHIES_SEASON;
                         if (newTrophyCount !== playerData.trophyCount) {
                             playerUpdates.trophyCount = newTrophyCount;
                             hasUpdates = true;
@@ -343,6 +343,42 @@ async function syncPlayFabPlayerData() {
         }
 
         console.log(`✅ PlayFab sync complete: ${updatedPlayers}/${totalPlayers} players updated, ${failedPlayers} failed`);
+
+        // Now update club total trophies by summing all player trophy counts
+        console.log('🏆 Updating club total trophies...');
+        
+        // Re-fetch clubs to get updated player data
+        const updatedClubSnapshot = await database.ref('clubs').once('value');
+        const updatedClubs = updatedClubSnapshot.val() || {};
+        
+        const clubTrophyUpdates = {};
+        let clubsUpdated = 0;
+        
+        for (const [clubId, clubData] of Object.entries(updatedClubs)) {
+            if (!clubData.players) continue;
+            
+            // Sum up all player trophy counts
+            let clubTotalTrophies = 0;
+            for (const playerData of Object.values(clubData.players)) {
+                clubTotalTrophies += playerData.trophyCount || 0;
+            }
+            
+            // Only update if different from current value
+            const currentClubTrophies = clubData.totalTrophies || 0;
+            if (clubTotalTrophies !== currentClubTrophies) {
+                clubTrophyUpdates[`clubs/${clubId}/totalTrophies`] = clubTotalTrophies;
+                clubTrophyUpdates[`clubs_summary/${clubId}/totalTrophies`] = clubTotalTrophies;
+                console.log(`  ✓ ${clubData.name}: ${currentClubTrophies} → ${clubTotalTrophies} trophies`);
+                clubsUpdated++;
+            }
+        }
+        
+        // Apply club trophy updates
+        if (Object.keys(clubTrophyUpdates).length > 0) {
+            await database.ref().update(clubTrophyUpdates);
+        }
+        
+        console.log(`✅ Club trophies updated: ${clubsUpdated} clubs`);
         
     } catch (error) {
         console.error('Error during PlayFab sync:', error);
@@ -404,11 +440,12 @@ async function initializeTournamentFetcher() {
         // Load current season first
         await loadCurrentSeason();
         
-        // Sync player data from PlayFab (names and trophies)
-        await syncPlayFabPlayerData();
-        
+        // Process tournaments first
         console.log(`Starting tournament fetcher for Season ${currentSeason}...`);
         await fetchAndProcessTournaments();
+        
+        // Then sync player data from PlayFab (names and trophies)
+        await syncPlayFabPlayerData();
     } catch (error) {
         console.error('Failed to initialize tournament fetcher:', error);
         console.log('Error: Failed to initialize tournament system');
