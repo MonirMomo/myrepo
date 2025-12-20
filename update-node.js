@@ -117,6 +117,13 @@ const API_CONFIG = {
     tournamentsDays: parseInt(process.env.TOURNAMENTS_DAYS) || 1 // How many days back to fetch tournaments
 };
 
+// PlayFab Configuration - For fetching player profiles and statistics
+const PLAYFAB_CONFIG = {
+    titleId: process.env.PLAYFAB_TITLE_ID || '',
+    secretKey: process.env.PLAYFAB_SECRET_KEY || '',
+    baseUrl: 'https://{titleId}.playfabapi.com'
+};
+
 // Validate required environment variables
 if (!API_CONFIG.accessToken || !API_CONFIG.appId) {
     console.error('❌ Missing required environment variables: API_ACCESS_TOKEN and/or API_APP_ID');
@@ -126,6 +133,15 @@ if (!API_CONFIG.accessToken || !API_CONFIG.appId) {
     console.log('- API_BASE_URL: API base URL (optional, defaults to current URL)');
     console.log('- TOURNAMENTS_DAYS: Number of days back to fetch (optional, defaults to 1)');
     process.exit(1);
+}
+
+// Validate PlayFab environment variables (optional - if not set, player sync will be skipped)
+const PLAYFAB_ENABLED = !!(PLAYFAB_CONFIG.titleId && PLAYFAB_CONFIG.secretKey);
+if (!PLAYFAB_ENABLED) {
+    console.warn('⚠️ PlayFab credentials not set. Player name/trophy sync will be skipped.');
+    console.log('To enable PlayFab sync, set these environment variables:');
+    console.log('- PLAYFAB_TITLE_ID: Your PlayFab Title ID');
+    console.log('- PLAYFAB_SECRET_KEY: Your PlayFab Developer Secret Key');
 }
 
 // Global Variables
@@ -143,6 +159,193 @@ async function loadCurrentSeason() {
     } catch (error) {
         console.error('Error loading current season:', error);
         currentSeason = 1; // Fallback to season 1
+    }
+}
+
+/**
+ * Gets the PlayFab API URL for a given endpoint
+ * @param {string} endpoint - API endpoint path
+ * @returns {string} Full PlayFab API URL
+ */
+function getPlayFabUrl(endpoint) {
+    return PLAYFAB_CONFIG.baseUrl.replace('{titleId}', PLAYFAB_CONFIG.titleId) + endpoint;
+}
+
+/**
+ * Fetches a player's profile from PlayFab Server API
+ * @param {string} playfabId - The player's PlayFab ID
+ * @returns {Object|null} Player profile with DisplayName, or null if failed
+ */
+async function getPlayFabPlayerProfile(playfabId) {
+    if (!PLAYFAB_ENABLED) return null;
+
+    try {
+        const response = await fetch(getPlayFabUrl('/Server/GetPlayerProfile'), {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-SecretKey': PLAYFAB_CONFIG.secretKey
+            },
+            body: JSON.stringify({
+                PlayFabId: playfabId,
+                ProfileConstraints: {
+                    ShowDisplayName: true,
+                    ShowStatistics: true
+                }
+            })
+        });
+
+        if (!response.ok) {
+            return null;
+        }
+
+        const result = await response.json();
+        if (result.code === 200 && result.data?.PlayerProfile) {
+            return result.data.PlayerProfile;
+        }
+        return null;
+    } catch (error) {
+        console.error(`Error fetching PlayFab profile for ${playfabId}:`, error.message);
+        return null;
+    }
+}
+
+/**
+ * Fetches a player's statistics from PlayFab Server API
+ * @param {string} playfabId - The player's PlayFab ID
+ * @param {string[]} statisticNames - Names of statistics to fetch (e.g., ['Trophies', 'TrophyCount'])
+ * @returns {Object|null} Statistics object, or null if failed
+ */
+async function getPlayFabPlayerStatistics(playfabId, statisticNames = ['Trophies']) {
+    if (!PLAYFAB_ENABLED) return null;
+
+    try {
+        const response = await fetch(getPlayFabUrl('/Server/GetPlayerStatistics'), {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-SecretKey': PLAYFAB_CONFIG.secretKey
+            },
+            body: JSON.stringify({
+                PlayFabId: playfabId,
+                StatisticNames: statisticNames
+            })
+        });
+
+        if (!response.ok) {
+            return null;
+        }
+
+        const result = await response.json();
+        if (result.code === 200 && result.data?.Statistics) {
+            // Convert array to object for easier access
+            const stats = {};
+            result.data.Statistics.forEach(stat => {
+                stats[stat.StatisticName] = stat.Value;
+            });
+            return stats;
+        }
+        return null;
+    } catch (error) {
+        console.error(`Error fetching PlayFab statistics for ${playfabId}:`, error.message);
+        return null;
+    }
+}
+
+/**
+ * Fetches player data from PlayFab and updates Firebase for all club players
+ * Updates player names and trophy counts from PlayFab
+ */
+async function syncPlayFabPlayerData() {
+    if (!PLAYFAB_ENABLED) {
+        console.log('⏭️ PlayFab sync skipped (credentials not configured)');
+        return;
+    }
+
+    console.log('🔄 Starting PlayFab player data sync...');
+    
+    try {
+        const clubSnapshot = await database.ref('clubs').once('value');
+        const clubs = clubSnapshot.val() || {};
+        
+        let totalPlayers = 0;
+        let updatedPlayers = 0;
+        let failedPlayers = 0;
+        const updates = {};
+
+        // Collect all players from all clubs
+        for (const [clubId, clubData] of Object.entries(clubs)) {
+            if (!clubData.players) continue;
+
+            for (const [playerKey, playerData] of Object.entries(clubData.players)) {
+                if (!playerData.playfabId) continue;
+                
+                totalPlayers++;
+                const normalizedId = playerData.playfabId.toUpperCase().replace(/\s/g, '');
+                
+                try {
+                    // Fetch profile and statistics in parallel
+                    const [profile, statistics] = await Promise.all([
+                        getPlayFabPlayerProfile(normalizedId),
+                        getPlayFabPlayerStatistics(normalizedId, ['Trophies'])
+                    ]);
+
+                    let hasUpdates = false;
+                    const playerUpdates = {};
+
+                    // Update display name if available and different
+                    if (profile?.DisplayName && profile.DisplayName !== playerData.name) {
+                        playerUpdates.name = profile.DisplayName;
+                        hasUpdates = true;
+                    }
+
+                    // Update trophy count if available
+                    if (statistics?.Trophies !== undefined) {
+                        const newTrophyCount = statistics.Trophies;
+                        if (newTrophyCount !== playerData.trophyCount) {
+                            playerUpdates.trophyCount = newTrophyCount;
+                            hasUpdates = true;
+                        }
+                    }
+
+                    if (hasUpdates) {
+                        // Queue the update
+                        updates[`clubs/${clubId}/players/${playerKey}`] = {
+                            ...playerData,
+                            ...playerUpdates,
+                            lastPlayFabSync: new Date().toISOString()
+                        };
+                        updatedPlayers++;
+                        console.log(`  ✓ ${normalizedId}: ${playerUpdates.name ? `name="${playerUpdates.name}"` : ''} ${playerUpdates.trophyCount !== undefined ? `trophies=${playerUpdates.trophyCount}` : ''}`);
+                    }
+
+                    // Small delay to avoid rate limiting
+                    await new Promise(resolve => setTimeout(resolve, 100));
+
+                } catch (error) {
+                    console.error(`  ✗ Failed to sync ${normalizedId}: ${error.message}`);
+                    failedPlayers++;
+                }
+            }
+        }
+
+        // Apply all updates in a single batch
+        if (Object.keys(updates).length > 0) {
+            // Process updates in batches to avoid Firebase limits
+            const updateEntries = Object.entries(updates);
+            const batchSize = 100;
+            
+            for (let i = 0; i < updateEntries.length; i += batchSize) {
+                const batch = updateEntries.slice(i, i + batchSize);
+                const batchUpdates = Object.fromEntries(batch);
+                await database.ref().update(batchUpdates);
+            }
+        }
+
+        console.log(`✅ PlayFab sync complete: ${updatedPlayers}/${totalPlayers} players updated, ${failedPlayers} failed`);
+        
+    } catch (error) {
+        console.error('Error during PlayFab sync:', error);
     }
 }
 
@@ -195,10 +398,15 @@ async function fetchClubsAndPlayers() {
  */
 async function initializeTournamentFetcher() {
     try {
-    // Pick the correct database before any reads/writes
-    await initializeDynamicDatabase();
+        // Pick the correct database before any reads/writes
+        await initializeDynamicDatabase();
+        
         // Load current season first
         await loadCurrentSeason();
+        
+        // Sync player data from PlayFab (names and trophies)
+        await syncPlayFabPlayerData();
+        
         console.log(`Starting tournament fetcher for Season ${currentSeason}...`);
         await fetchAndProcessTournaments();
     } catch (error) {
@@ -1099,6 +1307,7 @@ if (require.main === module) {
 module.exports = {
     initializeTournamentFetcher,
     fetchAndProcessTournaments,
+    syncPlayFabPlayerData,
     getTierFromName,
     getPointsMapping
 };
