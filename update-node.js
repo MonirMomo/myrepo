@@ -312,10 +312,12 @@ async function syncPlayFabPlayerData() {
                     }
 
                     // Update trophy count if available (statistic is named NUM_TROPHIES_SEASON in PlayFab)
+                    // Always include trophy count so we can sync to global players table
                     if (statistics?.NUM_TROPHIES_SEASON !== undefined) {
                         const newTrophyCount = statistics.NUM_TROPHIES_SEASON;
+                        playerUpdates.trophyCount = newTrophyCount;
+                        // Only mark hasUpdates for club if value changed (avoid unnecessary club writes)
                         if (newTrophyCount !== playerData.trophyCount) {
-                            playerUpdates.trophyCount = newTrophyCount;
                             hasUpdates = true;
                         }
                     }
@@ -329,22 +331,22 @@ async function syncPlayFabPlayerData() {
                 if (result.status === 'fulfilled') {
                     const { clubId, playerKey, playerData, normalizedId, playerUpdates, hasUpdates } = result.value;
                     
+                    // Always update global players table if we have trophy data (even if club data unchanged)
+                    if (playerUpdates.trophyCount !== undefined) {
+                        updates[`players/${normalizedId}/trophyCount`] = playerUpdates.trophyCount;
+                        updates[`players/${normalizedId}/seasons/${currentSeason}/trophyCount`] = playerUpdates.trophyCount;
+                    }
+                    if (playerUpdates.name) {
+                        updates[`players/${normalizedId}/name`] = playerUpdates.name;
+                    }
+                    
                     if (hasUpdates) {
-                        // Queue updates for club player data
+                        // Queue updates for club player data (only if changed)
                         updates[`clubs/${clubId}/players/${playerKey}`] = {
                             ...playerData,
                             ...playerUpdates,
                             lastPlayFabSync: new Date().toISOString()
                         };
-                        
-                        // Also update the players table with season-specific trophyCount (like app.js does)
-                        if (playerUpdates.trophyCount !== undefined) {
-                            updates[`players/${normalizedId}/trophyCount`] = playerUpdates.trophyCount;
-                            updates[`players/${normalizedId}/seasons/${currentSeason}/trophyCount`] = playerUpdates.trophyCount;
-                        }
-                        if (playerUpdates.name) {
-                            updates[`players/${normalizedId}/name`] = playerUpdates.name;
-                        }
                         
                         updatedPlayers++;
                         console.log(`  ✓ ${normalizedId}: ${playerUpdates.name ? `name="${playerUpdates.name}"` : ''} ${playerUpdates.trophyCount !== undefined ? `trophies=${playerUpdates.trophyCount}` : ''}`);
