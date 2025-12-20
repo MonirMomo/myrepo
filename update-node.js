@@ -304,6 +304,8 @@ async function syncPlayFabPlayerData() {
                         const newTrophyCount = statistics.NUM_TROPHIES_SEASON;
                         if (newTrophyCount !== playerData.trophyCount) {
                             playerUpdates.trophyCount = newTrophyCount;
+                            // Also update season-specific trophy count
+                            playerUpdates[`seasons/${currentSeason}/trophyCount`] = newTrophyCount;
                             hasUpdates = true;
                         }
                     }
@@ -365,10 +367,15 @@ async function syncPlayFabPlayerData() {
             
             // Only update if different from current value
             const currentClubTrophies = clubData.totalTrophies || 0;
-            if (clubTotalTrophies !== currentClubTrophies) {
+            const currentSeasonTrophies = clubData.seasons?.[currentSeason]?.totalTrophies || 0;
+            
+            if (clubTotalTrophies !== currentClubTrophies || clubTotalTrophies !== currentSeasonTrophies) {
+                // Update overall totalTrophies (current season trophies)
                 clubTrophyUpdates[`clubs/${clubId}/totalTrophies`] = clubTotalTrophies;
                 clubTrophyUpdates[`clubs_summary/${clubId}/totalTrophies`] = clubTotalTrophies;
-                console.log(`  ✓ ${clubData.name}: ${currentClubTrophies} → ${clubTotalTrophies} trophies`);
+                // Also update season-specific totalTrophies
+                clubTrophyUpdates[`clubs/${clubId}/seasons/${currentSeason}/totalTrophies`] = clubTotalTrophies;
+                console.log(`  ✓ ${clubData.name}: ${currentClubTrophies} → ${clubTotalTrophies} trophies (season ${currentSeason})`);
                 clubsUpdated++;
             }
         }
