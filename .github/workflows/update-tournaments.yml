@@ -24,3 +24,5 @@ jobs:
           API_APP_ID: ${{ secrets.API_APP_ID }}
           API_BASE_URL: ${{ secrets.API_BASE_URL }}
           TOURNAMENTS_DAYS: ${{ secrets.TOURNAMENTS_DAYS }}
+          PLAYFAB_TITLE_ID: ${{ secrets.PLAYFAB_TITLE_ID }}
+          PLAYFAB_SECRET_KEY: ${{ secrets.PLAYFAB_SECRET_KEY }}
