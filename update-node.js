@@ -660,7 +660,7 @@ function getTierFromName(name) {
         return 'america';
     }
     if (normalizedName.includes('championship')) {
-        return 'Unknown'; // Championship tournaments are not currently tracked
+        return 'championship';
     }
     
     // If no pattern matched, return Unknown
@@ -932,6 +932,7 @@ function getPointsMapping(tier) {
         roundMadnessUs: [7, 3.5, 1.7, 1.2],
         roundMadnessIndia: [6.4, 3.2, 1.6, 1.1],
         halloweenCup: [10, 5, 2.5, 2.5],
+        championship: [60, 30, 15, 15],
         Unknown: [0, 0, 0, 0]
     };
     
