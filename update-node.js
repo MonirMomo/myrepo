@@ -174,14 +174,16 @@ function getPlayFabUrl(endpoint) {
 
 /**
  * Fetches a player's profile from PlayFab Server API
+ * Gets the clean username from PLAYER_JSON user data (not DisplayName which has clan tags)
  * @param {string} playfabId - The player's PlayFab ID
- * @returns {Object|null} Player profile with DisplayName, or null if failed
+ * @returns {Object|null} Player profile with DisplayName (extracted from PLAYER_JSON.username), or null if failed
  */
 async function getPlayFabPlayerProfile(playfabId) {
     if (!PLAYFAB_ENABLED) return null;
 
     try {
-        const response = await fetch(getPlayFabUrl('/Server/GetPlayerProfile'), {
+        // Fetch user data to get the clean username from PLAYER_JSON
+        const response = await fetch(getPlayFabUrl('/Server/GetUserData'), {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -189,10 +191,7 @@ async function getPlayFabPlayerProfile(playfabId) {
             },
             body: JSON.stringify({
                 PlayFabId: playfabId,
-                ProfileConstraints: {
-                    ShowDisplayName: true,
-                    ShowStatistics: true
-                }
+                Keys: ['PLAYER_JSON']
             })
         });
 
@@ -201,8 +200,17 @@ async function getPlayFabPlayerProfile(playfabId) {
         }
 
         const result = await response.json();
-        if (result.code === 200 && result.data?.PlayerProfile) {
-            return result.data.PlayerProfile;
+        if (result.code === 200 && result.data?.Data?.PLAYER_JSON?.Value) {
+            try {
+                const playerJson = JSON.parse(result.data.Data.PLAYER_JSON.Value);
+                // Return an object with DisplayName set to the clean username
+                return {
+                    DisplayName: playerJson.username || null
+                };
+            } catch (parseError) {
+                console.error(`Error parsing PLAYER_JSON for ${playfabId}:`, parseError.message);
+                return null;
+            }
         }
         return null;
     } catch (error) {
