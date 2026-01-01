@@ -1071,28 +1071,30 @@ async function processTeamResults(team, pointsForPlacement, tier, clubsAlreadyAw
             await updateIndividualPlayerResult(playerId, tier, individualPlacement, individualPoints);
         }
 
-        // Update player stats in clubs ONLY if all 3 players are from the same registered club
+        // Process club results only for teams where ALL 3 players are from the same registered club
         if (allPlayersFromSameClub) {
+            const clubName = team.clubNames.find(club => club !== 'No Club');
+            const isFirstTeamFromClub = clubName && !clubsAlreadyAwarded.has(clubName);
+            
+            // Update player stats in clubs - medals for ALL teams, but points only for first team
             for (let i = 0; i < team.playerIds.length; i++) {
                 const playerId = team.playerIds[i];
                 const individualPlacement = team.placements[i];
                 const individualPoints = pointsForPlacement[individualPlacement - 1] || 0;
                 
-                // Update player points and stats in their club
                 if (players[playerId]) {
-                    await updatePlayerPoints(playerId, individualPoints);
+                    // All players get tournament medals/stats
                     await updatePlayerTournamentStats(playerId, tier, individualPlacement);
+                    
+                    // Only first team from club gets points
+                    if (isFirstTeamFromClub) {
+                        await updatePlayerPoints(playerId, individualPoints);
+                    }
                 }
             }
-        }
-
-        // Process club results only for teams where ALL 3 players are from the same registered club
-        if (allPlayersFromSameClub) {
-            const clubName = team.clubNames.find(club => club !== 'No Club');
             
-            // Skip if club already awarded in this tournament
-            if (clubName && !clubsAlreadyAwarded.has(clubName)) {
-                // Update club
+            // Update club stats only for first team from this club
+            if (isFirstTeamFromClub) {
                 await updateClubPoints(clubName, pointsAwarded);
                 await updateClubTournamentStats(clubName, tier, placement);
 
@@ -1114,7 +1116,7 @@ async function processTeamResults(team, pointsForPlacement, tier, clubsAlreadyAw
             processed: false,
             reason: !hasThreePlayers ? 'Invalid team size' : 
                    !allPlayersFromSameClub ? 'Not all players from same registered club' : 
-                   'Club already awarded',
+                   'Club already awarded (medals given, no points)',
             individualResults: team.playerIds.length
         };
 
