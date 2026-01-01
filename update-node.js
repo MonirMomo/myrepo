@@ -722,6 +722,7 @@ async function saveDailyTournamentResults(tournamentId, tournamentName, tier, so
         // Get top 4 teams (positions 1st, 2nd, 3rd, 3rd)
         const teamEntries = Object.entries(sortedTeams);
         const top4Results = [];
+        const clubsAlreadyAwarded = new Set(); // Track clubs to avoid showing duplicate points
         
         for (let i = 0; i < Math.min(4, teamEntries.length); i++) {
             const [teamId, team] = teamEntries[i];
@@ -750,9 +751,16 @@ async function saveDailyTournamentResults(tournamentId, tournamentName, tier, so
                 }
             }
             
+            // Only award points to the first occurrence of each club (matching actual awarding logic)
+            let awardedPoints = 0;
+            if (!isMixed && clubName && !clubsAlreadyAwarded.has(clubName)) {
+                awardedPoints = pointsForPlacement[placement - 1] || 0;
+                clubsAlreadyAwarded.add(clubName);
+            }
+            
             top4Results.push({
                 placement: placement,
-                points: pointsForPlacement[placement - 1] || 0,
+                points: awardedPoints,
                 isMixed: isMixed,
                 clubName: clubName,
                 clubId: clubId,
