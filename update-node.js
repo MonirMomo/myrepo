@@ -706,6 +706,82 @@ async function markTournamentAsProcessed(tournamentId) {
 }
 
 /**
+ * Saves tournament results to daily_results for display on the daily results page
+ * @param {string} tournamentId - Tournament ID
+ * @param {string} tournamentName - Tournament name
+ * @param {string} tier - Tournament tier
+ * @param {Object} sortedTeams - Teams sorted by placement
+ * @param {Object} players - Player lookup cache
+ */
+async function saveDailyTournamentResults(tournamentId, tournamentName, tier, sortedTeams, players) {
+    try {
+        const now = new Date();
+        const dateKey = now.toISOString().split('T')[0]; // YYYY-MM-DD format
+        
+        // Get top 4 teams (positions 1st, 2nd, 3rd, 3rd)
+        const teamEntries = Object.entries(sortedTeams);
+        const top4Results = [];
+        
+        for (let i = 0; i < Math.min(4, teamEntries.length); i++) {
+            const [teamId, team] = teamEntries[i];
+            const placement = Math.min(...team.placements);
+            const uniqueClubs = [...new Set(team.clubNames.filter(club => club !== 'No Club'))];
+            const hasThreePlayers = team.playerIds.length === 3;
+            
+            // Determine if this is a full club team or mixed
+            const allPlayersFromSameClub = hasThreePlayers && 
+                                           uniqueClubs.length === 1 && 
+                                           team.clubNames.filter(club => club !== 'No Club').length === 3;
+            
+            let clubName = null;
+            let clubId = null;
+            let isMixed = true;
+            
+            if (allPlayersFromSameClub || (uniqueClubs.length === 1 && team.clubNames.filter(c => c !== 'No Club').length === 3)) {
+                clubName = uniqueClubs[0];
+                isMixed = false;
+                // Try to get club ID from one of the players
+                for (const playerId of team.playerIds) {
+                    if (players[playerId] && players[playerId].clubId) {
+                        clubId = players[playerId].clubId;
+                        break;
+                    }
+                }
+            }
+            
+            top4Results.push({
+                placement: placement,
+                isMixed: isMixed,
+                clubName: clubName,
+                clubId: clubId,
+                players: team.playerIds.map((id, idx) => ({
+                    playfabId: id,
+                    name: team.playerNames[idx] || 'Unknown',
+                    club: team.clubNames[idx] || 'No Club'
+                }))
+            });
+        }
+        
+        // Save to daily_results/{dateKey}/{tournamentId}
+        const resultData = {
+            tournamentId: tournamentId,
+            tournamentName: tournamentName,
+            tier: tier,
+            processedAt: now.toISOString(),
+            season: currentSeason,
+            results: top4Results
+        };
+        
+        await database.ref(`daily_results/${dateKey}/${tournamentId}`).set(resultData);
+        console.log(`📅 Saved daily results for ${tournamentName} on ${dateKey}`);
+        
+    } catch (error) {
+        console.error('Error saving daily tournament results:', error);
+        // Don't throw - this is non-critical
+    }
+}
+
+/**
  * Fetches tournament participant data from API and processes it
  * @param {string} tournamentId - Tournament ID to fetch
  * @param {string} tier - Tournament tier/category
@@ -736,7 +812,7 @@ async function fetchAndProcessTournamentData(tournamentId, tier, tournamentName)
             throw new Error('Invalid tournament data format received');
         }
 
-        await processTournamentResults(tournamentData, tier, tournamentName);
+        await processTournamentResults(tournamentData, tier, tournamentName, tournamentId);
 
     } catch (error) {
         console.error(`Error processing tournament ${tournamentId}:`, error);
@@ -750,8 +826,9 @@ async function fetchAndProcessTournamentData(tournamentId, tier, tournamentName)
  * @param {Array} tournamentData - Raw tournament data from API
  * @param {string} tier - Tournament tier
  * @param {string} tournamentName - Tournament name for logging
+ * @param {string} tournamentId - Tournament ID for saving daily results
  */
-async function processTournamentResults(tournamentData, tier, tournamentName) {
+async function processTournamentResults(tournamentData, tier, tournamentName, tournamentId) {
     try {
         // Load fresh player data
         const players = await fetchClubsAndPlayers();
@@ -769,6 +846,11 @@ async function processTournamentResults(tournamentData, tier, tournamentName) {
         
         // Display top 4 teams with player IDs
         displayTop4Teams(sortedTeams, tournamentName, players);
+        
+        // Save daily results for the daily results page (Season 5+)
+        if (currentSeason >= 5 && tournamentId) {
+            await saveDailyTournamentResults(tournamentId, tournamentName, tier, sortedTeams, players);
+        }
         
         // Track which clubs have already been awarded to prevent duplicates
         const clubsAlreadyAwarded = new Set();
