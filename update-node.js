@@ -712,8 +712,9 @@ async function markTournamentAsProcessed(tournamentId) {
  * @param {string} tier - Tournament tier
  * @param {Object} sortedTeams - Teams sorted by placement
  * @param {Object} players - Player lookup cache
+ * @param {Array} pointsForPlacement - Points array [1st, 2nd, 3rd, 4th]
  */
-async function saveDailyTournamentResults(tournamentId, tournamentName, tier, sortedTeams, players) {
+async function saveDailyTournamentResults(tournamentId, tournamentName, tier, sortedTeams, players, pointsForPlacement) {
     try {
         const now = new Date();
         const dateKey = now.toISOString().split('T')[0]; // YYYY-MM-DD format
@@ -751,6 +752,7 @@ async function saveDailyTournamentResults(tournamentId, tournamentName, tier, so
             
             top4Results.push({
                 placement: placement,
+                points: pointsForPlacement[placement - 1] || 0,
                 isMixed: isMixed,
                 clubName: clubName,
                 clubId: clubId,
@@ -849,7 +851,7 @@ async function processTournamentResults(tournamentData, tier, tournamentName, to
         
         // Save daily results for the daily results page (Season 5+)
         if (currentSeason >= 5 && tournamentId) {
-            await saveDailyTournamentResults(tournamentId, tournamentName, tier, sortedTeams, players);
+            await saveDailyTournamentResults(tournamentId, tournamentName, tier, sortedTeams, players, pointsForPlacement);
         }
         
         // Track which clubs have already been awarded to prevent duplicates
