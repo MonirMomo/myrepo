@@ -1198,10 +1198,6 @@ async function updateClubTournamentStats(clubName, tier, placement) {
                 // Update overall/total stats
                 const overallTierRef = database.ref(`clubs/${clubId}/${tier}`);
                 
-                // Initialize tier stats if not exists for both season and overall
-                await initializeTournamentStats(seasonTierRef);
-                await initializeTournamentStats(overallTierRef);
-                
                 // Update appropriate placement counter
                 const statField = getStatFieldForPlacement(placement);
                 if (statField) {
@@ -1299,10 +1295,6 @@ async function updateIndividualPlayerResult(playerId, tier, placement, points) {
         // Update tournament tier stats for both season and overall
         const seasonTierRef = database.ref(`players/${playerId}/seasons/${currentSeason}/${tier}`);
         const overallTierRef = database.ref(`players/${playerId}/${tier}`);
-        
-        // Initialize tier stats if not exists
-        await initializeTournamentStats(seasonTierRef);
-        await initializeTournamentStats(overallTierRef);
         
         // Update placement stats
         const statField = getStatFieldForPlacement(placement);
@@ -1404,10 +1396,6 @@ async function updatePlayerTournamentStats(playerId, tier, placement) {
         // Update overall/total stats  
         const overallTierRef = database.ref(`clubs/${clubId}/players/${playerKey}/${tier}`);
         
-        // Initialize tier stats if not exists for both season and overall
-        await initializeTournamentStats(seasonTierRef);
-        await initializeTournamentStats(overallTierRef);
-        
         // Update appropriate placement counter
         const statField = getStatFieldForPlacement(placement);
         if (statField) {
@@ -1462,26 +1450,6 @@ async function findPlayerLocation(playerId) {
     } catch (error) {
         console.error('Error finding player location:', error);
         return null;
-    }
-}
-
-/**
- * Initializes tournament statistics structure if it doesn't exist
- * @param {Object} tierRef - Firebase reference to tournament tier
- */
-async function initializeTournamentStats(tierRef) {
-    try {
-        const snapshot = await tierRef.once('value');
-        if (!snapshot.exists()) {
-            await tierRef.set({
-                first: 0,
-                second: 0,
-                third: 0
-            });
-        }
-    } catch (error) {
-        console.error('Error initializing tournament stats:', error);
-        throw error;
     }
 }
 
