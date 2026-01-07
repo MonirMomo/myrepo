@@ -436,7 +436,6 @@ async function syncPlayFabPlayerData() {
             if (needsRootUpdate || needsSeasonUpdate) {
                 // Always write to all paths to keep them in sync
                 clubTrophyUpdates[`clubs/${clubId}/totalTrophies`] = clubTotalTrophies;
-                clubTrophyUpdates[`clubs_summary/${clubId}/totalTrophies`] = clubTotalTrophies;
                 clubTrophyUpdates[`clubs/${clubId}/seasons/${currentSeason}/totalTrophies`] = clubTotalTrophies;
                 
                 // Only log if the actual trophy count changed (not just syncing season path)
@@ -524,6 +523,9 @@ async function initializeTournamentFetcher() {
         
         // Then sync player data from PlayFab (names and trophies)
         await syncPlayFabPlayerData();
+        
+        // Clean up old chat messages (older than 7 days)
+        await cleanupOldChatMessages();
     } catch (error) {
         console.error('Failed to initialize tournament fetcher:', error);
         console.log('Error: Failed to initialize tournament system');
@@ -1163,9 +1165,6 @@ async function updateClubPoints(clubName, points) {
                 
                 await clubRef.update(updates);
                 
-                // Update clubs_summary with new total points
-                await database.ref(`clubs_summary/${clubId}/totalPoints`).set(currentTotalPoints + points);
-                
                 console.log(`Updated ${clubName} points: +${points} (season ${currentSeason}: ${currentSeasonPoints + points}, total: ${currentTotalPoints + points})`);
                 return;
             }
@@ -1454,6 +1453,71 @@ async function findPlayerLocation(playerId) {
 }
 
 /**
+ * Cleans up old chat messages (older than 7 days) from all clubs
+ * This runs automatically after tournament processing
+ */
+async function cleanupOldChatMessages() {
+    console.log('🧹 Cleaning up old chat messages...');
+    
+    try {
+        const clubChatSnapshot = await database.ref('club_chat').once('value');
+        const clubChats = clubChatSnapshot.val();
+        
+        if (!clubChats) {
+            console.log('  No club chats found');
+            return;
+        }
+        
+        const now = Date.now();
+        const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+        const cutoffTime = now - SEVEN_DAYS_MS;
+        
+        let totalOldMessages = 0;
+        let totalClubsAffected = 0;
+        const updates = {};
+        
+        for (const [clubId, messages] of Object.entries(clubChats)) {
+            if (typeof messages === 'object' && messages !== null) {
+                for (const [messageId, messageData] of Object.entries(messages)) {
+                    const timestamp = messageData.timestamp || 0;
+                    
+                    if (timestamp < cutoffTime) {
+                        updates[`club_chat/${clubId}/${messageId}`] = null;
+                        totalOldMessages++;
+                    }
+                }
+            }
+            
+            if (totalOldMessages > 0 && !updates[`club_chat/${clubId}`]) {
+                totalClubsAffected++;
+            }
+        }
+        
+        if (totalOldMessages === 0) {
+            console.log('  No old chat messages found (>7 days)');
+            return;
+        }
+        
+        // Delete in batches to avoid Firebase limits
+        const updateEntries = Object.entries(updates);
+        const batchSize = 500;
+        let deletedCount = 0;
+        
+        for (let i = 0; i < updateEntries.length; i += batchSize) {
+            const batch = updateEntries.slice(i, i + batchSize);
+            const batchUpdates = Object.fromEntries(batch);
+            await database.ref().update(batchUpdates);
+            deletedCount += batch.length;
+        }
+        
+        console.log(`✅ Deleted ${deletedCount} old chat messages from ${totalClubsAffected} clubs`);
+        
+    } catch (error) {
+        console.error('Error cleaning up old chats:', error);
+    }
+}
+
+/**
  * Maps placement number to database field name
  * @param {number} placement - Placement (1-4)
  * @returns {string|null} Database field name
@@ -1486,6 +1550,7 @@ module.exports = {
     initializeTournamentFetcher,
     fetchAndProcessTournaments,
     syncPlayFabPlayerData,
+    cleanupOldChatMessages,
     getTierFromName,
     getPointsMapping
 };
