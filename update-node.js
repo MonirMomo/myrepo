@@ -526,6 +526,12 @@ async function initializeTournamentFetcher() {
         
         // Clean up old chat messages (older than 7 days)
         await cleanupOldChatMessages();
+        
+        // Clean up old join requests (older than 14 days)
+        await cleanupOldJoinRequests();
+        
+        // Clean up old fetched tournaments (older than 30 days)
+        await cleanupOldFetchedTournaments();
     } catch (error) {
         console.error('Failed to initialize tournament fetcher:', error);
         console.log('Error: Failed to initialize tournament system');
@@ -629,10 +635,10 @@ function getTierFromName(name) {
     if (normalizedName.includes('silver') && normalizedName.includes('eu') && normalizedName.includes('2')) {
         return 'silverEu2';
     }
-    if (normalizedName.includes('silver') && normalizedName.includes('us') && normalizedName.includes('1')) {
+    if (normalizedName.includes('silver') && (normalizedName.includes('us') || normalizedName.includes('br')) && normalizedName.includes('1')) {
         return 'silverUs1';
     }
-    if (normalizedName.includes('silver') && normalizedName.includes('us') && normalizedName.includes('2')) {
+    if (normalizedName.includes('silver') && (normalizedName.includes('us') || normalizedName.includes('br')) && normalizedName.includes('2')) {
         return 'silverUs2';
     }
     
@@ -1518,6 +1524,101 @@ async function cleanupOldChatMessages() {
 }
 
 /**
+ * Cleans up old join requests (older than 14 days)
+ * This runs automatically after tournament processing
+ */
+async function cleanupOldJoinRequests() {
+    console.log('🧹 Cleaning up old join requests...');
+    
+    try {
+        const requestsSnapshot = await database.ref('club_join_requests').once('value');
+        const requests = requestsSnapshot.val();
+        
+        if (!requests) {
+            console.log('  No join requests found');
+            return;
+        }
+        
+        const now = Date.now();
+        const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
+        const cutoffTime = now - FOURTEEN_DAYS_MS;
+        
+        const updates = {};
+        let totalOldRequests = 0;
+        
+        for (const [requestId, requestData] of Object.entries(requests)) {
+            const timestamp = requestData.timestamp || 0;
+            
+            if (timestamp < cutoffTime) {
+                updates[`club_join_requests/${requestId}`] = null;
+                totalOldRequests++;
+            }
+        }
+        
+        if (totalOldRequests === 0) {
+            console.log('  No old join requests found (>14 days)');
+            return;
+        }
+        
+        // Delete using multi-path update
+        await database.ref().update(updates);
+        
+        console.log(`✅ Deleted ${totalOldRequests} old join requests (>14 days)`);
+        
+    } catch (error) {
+        console.error('Error cleaning up old join requests:', error);
+    }
+}
+
+/**
+ * Cleans up old fetched tournaments (older than 30 days)
+ * This runs automatically after tournament processing
+ */
+async function cleanupOldFetchedTournaments() {
+    console.log('🧹 Cleaning up old fetched tournaments...');
+    
+    try {
+        const tournamentsSnapshot = await database.ref('fetchedTournaments').once('value');
+        const tournaments = tournamentsSnapshot.val();
+        
+        if (!tournaments) {
+            console.log('  No fetched tournaments found');
+            return;
+        }
+        
+        const now = Date.now();
+        const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+        const cutoffTime = now - THIRTY_DAYS_MS;
+        
+        const updates = {};
+        let totalOldTournaments = 0;
+        
+        for (const [tournamentId, tournamentData] of Object.entries(tournaments)) {
+            // fetchedAt is stored as ISO date string
+            const fetchedAt = tournamentData.fetchedAt ? new Date(tournamentData.fetchedAt).getTime() : 0;
+            
+            if (fetchedAt < cutoffTime) {
+                updates[`fetchedTournaments/${tournamentId}`] = null;
+                totalOldTournaments++;
+            }
+        }
+        
+        if (totalOldTournaments === 0) {
+            console.log('  No old fetched tournaments found (>30 days)');
+            return;
+        }
+        
+        // Delete using multi-path update
+        await database.ref().update(updates);
+        
+        console.log(`✅ Deleted ${totalOldTournaments} old fetched tournaments (>30 days)`);
+        
+    } catch (error) {
+        console.error('Error cleaning up old fetched tournaments:', error);
+    }
+}
+
+/**
  * Maps placement number to database field name
  * @param {number} placement - Placement (1-4)
  * @returns {string|null} Database field name
@@ -1551,6 +1652,8 @@ module.exports = {
     fetchAndProcessTournaments,
     syncPlayFabPlayerData,
     cleanupOldChatMessages,
+    cleanupOldJoinRequests,
+    cleanupOldFetchedTournaments,
     getTierFromName,
     getPointsMapping
 };
