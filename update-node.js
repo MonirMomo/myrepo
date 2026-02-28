@@ -629,6 +629,9 @@ function getTierFromName(name) {
     if (normalizedName.includes('silver') && normalizedName.includes('singapore')) {
         return 'silverAsia1';
     }
+    if (normalizedName.includes('silver') && normalizedName.includes('india')) {
+        return 'silverAsia2';
+    }
     if (normalizedName.includes('silver') && normalizedName.includes('eu') && normalizedName.includes('1')) {
         return 'silverEu1';
     }
@@ -1032,10 +1035,11 @@ function getPointsMapping(tier) {
         silverEu2: [2, 1, 0.5, 0.5],
         silverEu1: [1.6, 0.8, 0.4, 0.4],
         silverUs1: [1.4, 0.7, 0.3, 0.3],
-        asia: [1.8, 0.9, 0.4, 0.4],
+        asia: [1.4, 0.7, 0.4, 0.4],
         america: [2, 1, 0.5, 0.5],
         silverUs2: [1.2, 0.6, 0, 0],
-        silverAsia1: [1.8, 0.9, 0.4, 0.4],
+        silverAsia1: [1, 0.5, 0.3, 0.3],
+        silverAsia2: [1, 0.5, 0.3, 0.3],
         roundMadnessEu: [10, 5, 2.5, 1.7],
         roundMadnessUs: [7, 3.5, 1.7, 1.2],
         roundMadnessIndia: [6.4, 3.2, 1.6, 1.1],
