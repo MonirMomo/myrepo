@@ -1037,7 +1037,7 @@ function getPointsMapping(tier) {
         silverUs1: [1.4, 0.7, 0.3, 0.3],
         asia: [1.6, 0.8, 0.4, 0.4],
         america: [2, 1, 0.5, 0.5],
-        silverUs2: [1.2, 0.6, 0, 0],
+        silverUs2: [1.2, 0.6, 0.3, 0.3],
         silverAsia1: [1, 0.5, 0.2, 0.2],
         silverAsia2: [1, 0.5, 0.2, 0.2],
         roundMadnessEu: [10, 5, 2.5, 1.7],
