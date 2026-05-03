@@ -242,17 +242,19 @@ function buildChallengeSeasonPatch(playerData, profile, seasonNum) {
     }
     const cg = profile.careerGoals;
     const ca = profile.careerAssists;
+    const sk = String(seasonNum);
     const seasons = { ...(playerData.seasons || {}) };
-    const prevSeas = { ...(seasons[seasonNum] || {}) };
+    const prevSeas = getSeasonEntryFromPlayer(playerData, seasonNum);
     let gBaseline = prevSeas.challengeGoalsBaseline;
     let aBaseline = prevSeas.challengeAssistsBaseline;
-    if (gBaseline === undefined || aBaseline === undefined) {
+    const firstAnchor = gBaseline === undefined || aBaseline === undefined;
+    if (firstAnchor) {
         gBaseline = cg;
         aBaseline = ca;
     }
     const goalsContrib = Math.max(0, cg - gBaseline);
     const assistsContrib = Math.max(0, ca - aBaseline);
-    seasons[seasonNum] = {
+    seasons[sk] = {
         ...prevSeas,
         challengeGoalsBaseline: gBaseline,
         challengeAssistsBaseline: aBaseline,
@@ -267,7 +269,10 @@ function buildChallengeSeasonPatch(playerData, profile, seasonNum) {
         },
         goalsContrib,
         assistsContrib,
-        challengeApplied: true
+        challengeApplied: true,
+        careerGoals: cg,
+        careerAssists: ca,
+        firstAnchor
     };
 }
 
@@ -280,6 +285,15 @@ function isChallengeSeasonDirty(prevSeasonObj, nextSeasonObj) {
         prevSeasonObj.challengeSeasonGoals !== nextSeasonObj.challengeSeasonGoals ||
         prevSeasonObj.challengeSeasonAssists !== nextSeasonObj.challengeSeasonAssists
     );
+}
+
+/** RTDB / JS may use string or numeric season keys — read one canonical bucket */
+function getSeasonEntryFromPlayer(playerData, seasonNum) {
+    const seasons = playerData?.seasons;
+    if (!seasons || typeof seasons !== 'object' || Array.isArray(seasons)) return {};
+    const sk = String(seasonNum);
+    const raw = seasons[sk] !== undefined ? seasons[sk] : seasons[seasonNum];
+    return raw && typeof raw === 'object' ? { ...raw } : {};
 }
 
 /**
@@ -348,6 +362,7 @@ async function syncPlayFabPlayerData() {
         if (timeSinceLastSync < syncIntervalMs) {
             const hoursRemaining = ((syncIntervalMs - timeSinceLastSync) / (1000 * 60 * 60)).toFixed(1);
             console.log(`⏭️ PlayFab sync skipped (last sync was ${hoursAgo}h ago, next sync in ${hoursRemaining}h)`);
+            console.log('   (Names, trophies, PLAYER_JSON career goals/assists, and club challenge rollups are not updated when sync is skipped.)');
             return;
         }
         console.log(`🔄 Starting PlayFab player data sync (last sync was ${hoursAgo}h ago)...`);
@@ -375,6 +390,7 @@ async function syncPlayFabPlayerData() {
         
         const totalPlayers = allPlayers.length;
         console.log(`  Found ${totalPlayers} players to sync...`);
+        console.log('  Challenge "seasonΔ" = PLAYFAB career goals/assists minus this season\'s baseline. The first hub sync for a player (or new season) sets baseline = current career, so seasonΔ is 0 until they earn more ranked goals/assists; club bar is the sum of all members\' seasonΔ.');
 
         let milestonesConfig = DEFAULT_CLUB_CHALLENGE_MILESTONES;
         try {
@@ -437,8 +453,9 @@ async function syncPlayFabPlayerData() {
                     const ch = buildChallengeSeasonPatch(playerData, profile, currentSeason);
                     let writeChallenge = false;
                     if (ch.challengeApplied && ch.challengePatch) {
-                        const prevS = playerData.seasons?.[currentSeason];
-                        const nextS = ch.challengePatch.seasons[currentSeason];
+                        const prevS = getSeasonEntryFromPlayer(playerData, currentSeason);
+                        const sk = String(currentSeason);
+                        const nextS = ch.challengePatch.seasons[sk];
                         writeChallenge = isChallengeSeasonDirty(prevS, nextS) ||
                             playerData.playfabCareerGoals !== ch.challengePatch.playfabCareerGoals ||
                             playerData.playfabCareerAssists !== ch.challengePatch.playfabCareerAssists;
@@ -495,7 +512,12 @@ async function syncPlayFabPlayerData() {
                         const parts = [];
                         if (playerUpdates.name) parts.push(`name="${playerUpdates.name}"`);
                         if (playerUpdates.trophyCount !== undefined) parts.push(`trophies=${playerUpdates.trophyCount}`);
-                        if (writeChallenge) parts.push(`challenges goals=${ch.goalsContrib} assists=${ch.assistsContrib}`);
+                        if (writeChallenge) {
+                            const anchorNote = ch.firstAnchor ? 'first-anchor' : 'baseline';
+                            parts.push(
+                                `challenges PLAYFAB career goals=${ch.careerGoals} assists=${ch.careerAssists} | seasonΔ goals=${ch.goalsContrib} assists=${ch.assistsContrib} (${anchorNote})`
+                            );
+                        }
                         console.log(`  ✓ ${normalizedId}: ${parts.join(' ')}`.trim() || `  ✓ ${normalizedId}: (sync)`);
                     }
                 } else {
