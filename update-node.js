@@ -241,8 +241,10 @@ function buildChallengeSeasonPatch(playerData, profile, seasonNum) {
     }
     const cg = profile.careerGoals;
     const ca = profile.careerAssists;
+    const sn = parseInt(String(seasonNum), 10);
     const sk = String(seasonNum);
-    const seasons = { ...(playerData.seasons || {}) };
+    const src = playerData.seasons;
+
     const prevSeas = getSeasonEntryFromPlayer(playerData, seasonNum);
     let gBaseline = prevSeas.challengeGoalsBaseline;
     let aBaseline = prevSeas.challengeAssistsBaseline;
@@ -253,16 +255,33 @@ function buildChallengeSeasonPatch(playerData, profile, seasonNum) {
     }
     const goalsContrib = Math.max(0, cg - gBaseline);
     const assistsContrib = Math.max(0, ca - aBaseline);
-    seasons[sk] = {
+
+    const mergedSeasonSlice = {
         ...prevSeas,
         challengeGoalsBaseline: gBaseline,
         challengeAssistsBaseline: aBaseline,
         challengeSeasonGoals: goalsContrib,
         challengeSeasonAssists: assistsContrib
     };
+
+    let seasonsOut;
+    if (Array.isArray(src)) {
+        seasonsOut = [...src];
+        while (seasonsOut.length <= sn) seasonsOut.push(null);
+        const existing = seasonsOut[sn] && typeof seasonsOut[sn] === 'object' ? seasonsOut[sn] : {};
+        seasonsOut[sn] = { ...existing, ...mergedSeasonSlice };
+    } else if (src && typeof src === 'object') {
+        seasonsOut = { ...src };
+        const prior = seasonsOut[sk] !== undefined ? seasonsOut[sk] : seasonsOut[sn];
+        const existing = prior && typeof prior === 'object' ? prior : {};
+        seasonsOut[sk] = { ...existing, ...mergedSeasonSlice };
+    } else {
+        seasonsOut = { [sk]: mergedSeasonSlice };
+    }
+
     return {
         challengePatch: {
-            seasons,
+            seasons: seasonsOut,
             playfabCareerGoals: cg,
             playfabCareerAssists: ca
         },
@@ -286,13 +305,26 @@ function isChallengeSeasonDirty(prevSeasonObj, nextSeasonObj) {
     );
 }
 
-/** RTDB / JS may use string or numeric season keys — read one canonical bucket */
+/** RTDB: season bucket as object key "9" / 9, or legacy array seasons[seasonNum] */
 function getSeasonEntryFromPlayer(playerData, seasonNum) {
     const seasons = playerData?.seasons;
-    if (!seasons || typeof seasons !== 'object' || Array.isArray(seasons)) return {};
+    if (!seasons || typeof seasons !== 'object') return {};
+    const sn = parseInt(String(seasonNum), 10);
+    if (Array.isArray(seasons)) {
+        const raw = seasons[sn];
+        return raw && typeof raw === 'object' ? { ...raw } : {};
+    }
     const sk = String(seasonNum);
     const raw = seasons[sk] !== undefined ? seasons[sk] : seasons[seasonNum];
     return raw && typeof raw === 'object' ? { ...raw } : {};
+}
+
+function getSeasonBucketFromPatchSeasons(seasonsVal, seasonNum) {
+    if (!seasonsVal || typeof seasonsVal !== 'object') return undefined;
+    const sn = parseInt(String(seasonNum), 10);
+    if (Array.isArray(seasonsVal)) return seasonsVal[sn];
+    const sk = String(seasonNum);
+    return seasonsVal[sk] !== undefined ? seasonsVal[sk] : seasonsVal[seasonNum];
 }
 
 /**
@@ -440,8 +472,7 @@ async function syncPlayFabPlayerData() {
                     let writeChallenge = false;
                     if (ch.challengeApplied && ch.challengePatch) {
                         const prevS = getSeasonEntryFromPlayer(playerData, currentSeason);
-                        const sk = String(currentSeason);
-                        const nextS = ch.challengePatch.seasons[sk];
+                        const nextS = getSeasonBucketFromPatchSeasons(ch.challengePatch.seasons, currentSeason);
                         writeChallenge = isChallengeSeasonDirty(prevS, nextS) ||
                             playerData.playfabCareerGoals !== ch.challengePatch.playfabCareerGoals ||
                             playerData.playfabCareerAssists !== ch.challengePatch.playfabCareerAssists;
