@@ -121,8 +121,7 @@ const API_CONFIG = {
 const PLAYFAB_CONFIG = {
     titleId: process.env.PLAYFAB_TITLE_ID || '',
     secretKey: process.env.PLAYFAB_SECRET_KEY || '',
-    baseUrl: 'https://{titleId}.playfabapi.com',
-    syncIntervalHours: parseInt(process.env.PLAYFAB_SYNC_INTERVAL_HOURS) || 6 // Minimum hours between syncs
+    baseUrl: 'https://{titleId}.playfabapi.com'
 };
 
 // Validate required environment variables
@@ -340,8 +339,7 @@ async function getPlayFabPlayerStatistics(playfabId, statisticNames = ['Trophies
 
 /**
  * Fetches player data from PlayFab and updates Firebase for all club players
- * Updates player names and trophy counts from PlayFab
- * Respects sync interval to avoid excessive API calls
+ * (names, trophies, PLAYER_JSON career stats, club challenges). Runs on every job invocation.
  */
 async function syncPlayFabPlayerData() {
     if (!PLAYFAB_ENABLED) {
@@ -349,27 +347,15 @@ async function syncPlayFabPlayerData() {
         return;
     }
 
-    // Check if enough time has passed since last sync
-    const syncIntervalMs = PLAYFAB_CONFIG.syncIntervalHours * 60 * 60 * 1000;
     const lastSyncSnapshot = await database.ref('config/lastPlayFabSync').once('value');
     const lastSyncTime = lastSyncSnapshot.val();
-    
     if (lastSyncTime) {
-        const lastSyncDate = new Date(lastSyncTime);
-        const timeSinceLastSync = Date.now() - lastSyncDate.getTime();
-        const hoursAgo = (timeSinceLastSync / (1000 * 60 * 60)).toFixed(1);
-        
-        if (timeSinceLastSync < syncIntervalMs) {
-            const hoursRemaining = ((syncIntervalMs - timeSinceLastSync) / (1000 * 60 * 60)).toFixed(1);
-            console.log(`⏭️ PlayFab sync skipped (last sync was ${hoursAgo}h ago, next sync in ${hoursRemaining}h)`);
-            console.log('   (Names, trophies, PLAYER_JSON career goals/assists, and club challenge rollups are not updated when sync is skipped.)');
-            return;
-        }
-        console.log(`🔄 Starting PlayFab player data sync (last sync was ${hoursAgo}h ago)...`);
+        const hoursAgo = ((Date.now() - new Date(lastSyncTime).getTime()) / (1000 * 60 * 60)).toFixed(1);
+        console.log(`🔄 Starting PlayFab player data sync (previous run ${hoursAgo}h ago)...`);
     } else {
-        console.log('🔄 Starting PlayFab player data sync (first time)...');
+        console.log('🔄 Starting PlayFab player data sync (no prior lastPlayFabSync in config)...');
     }
-    
+
     try {
         const clubSnapshot = await database.ref('clubs').once('value');
         const clubs = clubSnapshot.val() || {};
@@ -604,9 +590,9 @@ async function syncPlayFabPlayerData() {
         
         console.log(`✅ Club trophies updated: ${clubsUpdated} clubs`);
         
-        // Save the last sync timestamp
+        // Save the last successful sync timestamp (for logs / ops; sync is not interval-gated)
         await database.ref('config/lastPlayFabSync').set(new Date().toISOString());
-        console.log(`📅 Next PlayFab sync available in ${PLAYFAB_CONFIG.syncIntervalHours} hours`);
+        console.log('📅 config/lastPlayFabSync updated');
         
     } catch (error) {
         console.error('Error during PlayFab sync:', error);
