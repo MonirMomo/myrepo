@@ -177,6 +177,21 @@ const DEFAULT_CLUB_CHALLENGE_MILESTONES = {
     assists: [100, 250, 500, 1000]
 };
 
+/**
+ * When pooled club season goals AND assists both reach milestones.goals[i] & milestones.assists[i],
+ * grant these pending bags (same as game GiveRewards → open_*). Index aligns with milestone tier.
+ * Override via settings/clubChallengeBagRewards (array of { allStarBags, mvpBags }).
+ */
+const DEFAULT_CLUB_CHALLENGE_BAG_REWARDS = [
+    { allStarBags: 1, mvpBags: 0 },
+    { allStarBags: 2, mvpBags: 0 },
+    { allStarBags: 0, mvpBags: 1 },
+    { allStarBags: 0, mvpBags: 2 }
+];
+
+/** TESTING: set to '' to grant bags to every roster member again. When set, only this PlayFab ID gets PlayFab increments. */
+const CLUB_CHALLENGE_BAG_TEST_ONLY_PLAYFAB_ID = '41FCED8D2DB8D250';
+
 function parsePlayerJsonCareerInt(val) {
     if (val === undefined || val === null) return null;
     const n = typeof val === 'number' ? val : parseInt(String(val), 10);
@@ -213,6 +228,215 @@ function sanitizeForFirebaseUpdateManual(value) {
         out[key] = sanitizeForFirebaseUpdateManual(value[key]);
     }
     return out;
+}
+
+function parsePlayerJsonOpenBagInt(val) {
+    if (val === undefined || val === null) return 0;
+    const n = typeof val === 'number' ? val : parseInt(String(val), 10);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
+/** Season bucket on a club document (array or keyed object), same layout as players */
+function getSeasonBucketFromClub(clubData, seasonNum) {
+    const seasons = clubData?.seasons;
+    if (!seasons || typeof seasons !== 'object') return {};
+    const sn = parseInt(String(seasonNum), 10);
+    if (Array.isArray(seasons)) {
+        const raw = seasons[sn];
+        return raw && typeof raw === 'object' ? { ...raw } : {};
+    }
+    const sk = String(seasonNum);
+    const raw = seasons[sk] !== undefined ? seasons[sk] : seasons[seasonNum];
+    return raw && typeof raw === 'object' ? { ...raw } : {};
+}
+
+function isChallengeBagTierClaimed(seasonBucket, tierIndex) {
+    const c = seasonBucket?.challengeBagTiersClaimed;
+    if (!c || typeof c !== 'object') return false;
+    return !!(c[tierIndex] || c[String(tierIndex)]);
+}
+
+function normalizeBagRewardsFromSettings(arr) {
+    if (!Array.isArray(arr)) return DEFAULT_CLUB_CHALLENGE_BAG_REWARDS;
+    const out = arr.map((row) => ({
+        allStarBags: Math.max(0, parseInt(String(row?.allStarBags ?? 0), 10) || 0),
+        mvpBags: Math.max(0, parseInt(String(row?.mvpBags ?? 0), 10) || 0)
+    }));
+    return out.length ? out : DEFAULT_CLUB_CHALLENGE_BAG_REWARDS;
+}
+
+/**
+ * Increment PlayFab USER PLAYER_JSON open_allStarBag / open_mvpBag (mirrors GiveRewards pending inventory).
+ */
+async function incrementPlayFabOpenBags(playfabId, allStarDelta, mvpDelta) {
+    if (!PLAYFAB_ENABLED) return { ok: false, error: 'playfab_disabled' };
+    const asd = allStarDelta || 0;
+    const md = mvpDelta || 0;
+    if (asd <= 0 && md <= 0) return { ok: true, skipped: true };
+
+    try {
+        const getRes = await fetch(getPlayFabUrl('/Server/GetUserData'), {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-SecretKey': PLAYFAB_CONFIG.secretKey
+            },
+            body: JSON.stringify({
+                PlayFabId: playfabId,
+                Keys: ['PLAYER_JSON']
+            })
+        });
+        if (!getRes.ok) {
+            return { ok: false, error: `GetUserData http ${getRes.status}` };
+        }
+        const getBody = await getRes.json();
+        if (getBody.code !== 200 || !getBody.data?.Data?.PLAYER_JSON?.Value) {
+            return { ok: false, error: getBody.errorMessage || 'no PLAYER_JSON user data' };
+        }
+        let pj;
+        try {
+            pj = JSON.parse(getBody.data.Data.PLAYER_JSON.Value);
+        } catch (e) {
+            return { ok: false, error: `PLAYER_JSON parse: ${e.message}` };
+        }
+        pj.open_allStarBag = parsePlayerJsonOpenBagInt(pj.open_allStarBag) + asd;
+        pj.open_mvpBag = parsePlayerJsonOpenBagInt(pj.open_mvpBag) + md;
+
+        const putRes = await fetch(getPlayFabUrl('/Server/UpdateUserData'), {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-SecretKey': PLAYFAB_CONFIG.secretKey
+            },
+            body: JSON.stringify({
+                PlayFabId: playfabId,
+                Data: {
+                    PLAYER_JSON: JSON.stringify(pj)
+                },
+                Permission: 'Public'
+            })
+        });
+        if (!putRes.ok) {
+            return { ok: false, error: `UpdateUserData http ${putRes.status}` };
+        }
+        const putBody = await putRes.json();
+        if (putBody.code !== 200) {
+            return { ok: false, error: putBody.errorMessage || String(putBody.code) };
+        }
+        return { ok: true };
+    } catch (err) {
+        return { ok: false, error: err.message };
+    }
+}
+
+/**
+ * When pooled goals & assists both hit milestone tier i, grant bagRewardsTiers[i] to every roster member via PlayFab.
+ */
+async function grantClubChallengeBagRewards({
+    clubs,
+    clubChallengeAccum,
+    milestonesConfig,
+    bagRewardsTiers,
+    bagRewardsEnabled,
+    currentSeason,
+    updates
+}) {
+    if (!bagRewardsEnabled) {
+        console.log('  🎁 Club challenge bag rewards: off (settings/clubChallengeBagRewardsEnabled !== true)');
+        return;
+    }
+    if (!PLAYFAB_ENABLED) {
+        console.log('  🎁 Club challenge bag rewards: skipped (PlayFab not configured)');
+        return;
+    }
+
+    const goalMs = milestonesConfig.goals || [];
+    const astMs = milestonesConfig.assists || [];
+    const nTiers = Math.min(goalMs.length, astMs.length, bagRewardsTiers.length);
+    if (nTiers <= 0) {
+        console.log('  🎁 Club challenge bag rewards: no aligned tiers (check milestones vs clubChallengeBagRewards length)');
+        return;
+    }
+
+    console.log('  🎁 Club challenge bag rewards (PlayFab PLAYER_JSON open_allStarBag / open_mvpBag)...');
+
+    const testOnlyId = CLUB_CHALLENGE_BAG_TEST_ONLY_PLAYFAB_ID
+        ? String(CLUB_CHALLENGE_BAG_TEST_ONLY_PLAYFAB_ID).toUpperCase().replace(/\s/g, '')
+        : '';
+    if (testOnlyId) {
+        console.log(`  🎁 TEST MODE: PlayFab bag grants only for ${testOnlyId} (clear CLUB_CHALLENGE_BAG_TEST_ONLY_PLAYFAB_ID to grant full roster)`);
+    }
+
+    let tiersNewlyGranted = 0;
+    let playfabWrites = 0;
+
+    for (const [clubId, clubData] of Object.entries(clubs)) {
+        if (!clubData.players) continue;
+        const sums = clubChallengeAccum[clubId];
+        if (!sums) continue;
+
+        const pg = sums.goals || 0;
+        const pa = sums.assists || 0;
+        const seasonBucket = getSeasonBucketFromClub(clubData, currentSeason);
+
+        for (let tierIdx = 0; tierIdx < nTiers; tierIdx++) {
+            if (pg < goalMs[tierIdx] || pa < astMs[tierIdx]) continue;
+            if (isChallengeBagTierClaimed(seasonBucket, tierIdx)) continue;
+
+            const reward = bagRewardsTiers[tierIdx];
+            const addAs = reward.allStarBags || 0;
+            const addMvp = reward.mvpBags || 0;
+            if (addAs <= 0 && addMvp <= 0) {
+                updates[`clubs/${clubId}/seasons/${currentSeason}/challengeBagTiersClaimed/${tierIdx}`] = true;
+                tiersNewlyGranted++;
+                continue;
+            }
+
+            const memberEntries = Object.entries(clubData.players).filter(([, p]) => p?.playfabId);
+            if (memberEntries.length === 0) continue;
+
+            let tierOk = true;
+            let grantTargets = 0;
+            for (const [, playerData] of memberEntries) {
+                const pid = String(playerData.playfabId).toUpperCase().replace(/\s/g, '');
+                if (testOnlyId && pid !== testOnlyId) continue;
+
+                grantTargets++;
+                const r = await incrementPlayFabOpenBags(pid, addAs, addMvp);
+                playfabWrites++;
+                if (!r.ok) {
+                    tierOk = false;
+                    console.error(
+                        `  🎁 FAILED bag tier ${tierIdx} club "${clubData.name || clubId}" player ${pid}: ${r.error}`
+                    );
+                    break;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 35));
+            }
+
+            if ((addAs > 0 || addMvp > 0) && testOnlyId && grantTargets === 0) {
+                tierOk = false;
+                console.warn(
+                    `  🎁 TEST MODE: ${testOnlyId} not on roster for "${clubData.name || clubId}" — tier ${tierIdx + 1} not claimed`
+                );
+            }
+
+            if (tierOk) {
+                updates[`clubs/${clubId}/seasons/${currentSeason}/challengeBagTiersClaimed/${tierIdx}`] = true;
+                tiersNewlyGranted++;
+                const rosterNote = testOnlyId
+                    ? `${grantTargets} test account(s) (roster has ${memberEntries.length})`
+                    : `${memberEntries.length} member(s)`;
+                console.log(
+                    `  🎁 "${clubData.name || clubId}": milestone tier ${tierIdx + 1}/${nTiers} → +${addAs} All-Star bag(s), +${addMvp} MVP bag(s) × ${rosterNote}`
+                );
+            }
+        }
+    }
+
+    console.log(
+        `  🎁 Bag rewards summary: ${tiersNewlyGranted} club-tier grant(s) recorded, ${playfabWrites} PlayFab update(s)`
+    );
 }
 
 /**
@@ -521,8 +745,14 @@ async function syncPlayFabPlayerData() {
         console.log('  Challenge "seasonΔ" = PLAYFAB career goals/assists minus this season\'s baseline. The first hub sync for a player (or new season) sets baseline = current career, so seasonΔ is 0 until they earn more ranked goals/assists; club bar is the sum of all members\' seasonΔ.');
 
         let milestonesConfig = DEFAULT_CLUB_CHALLENGE_MILESTONES;
+        let bagRewardsEnabled = true;
+        let bagRewardsTiers = DEFAULT_CLUB_CHALLENGE_BAG_REWARDS;
         try {
-            const mileSnap = await database.ref('settings/clubChallengeMilestones').once('value');
+            const [mileSnap, bagEnabledSnap, bagRewardsSnap] = await Promise.all([
+                database.ref('settings/clubChallengeMilestones').once('value'),
+                database.ref('settings/clubChallengeBagRewardsEnabled').once('value'),
+                database.ref('settings/clubChallengeBagRewards').once('value')
+            ]);
             if (!mileSnap.exists()) {
                 await database.ref('settings/clubChallengeMilestones').set(DEFAULT_CLUB_CHALLENGE_MILESTONES);
                 milestonesConfig = DEFAULT_CLUB_CHALLENGE_MILESTONES;
@@ -535,8 +765,14 @@ async function syncPlayFabPlayerData() {
                     };
                 }
             }
+            if (bagEnabledSnap.exists() && bagEnabledSnap.val() === false) {
+                bagRewardsEnabled = false;
+            }
+            if (bagRewardsSnap.exists() && bagRewardsSnap.val() != null) {
+                bagRewardsTiers = normalizeBagRewardsFromSettings(bagRewardsSnap.val());
+            }
         } catch (e) {
-            console.warn('Could not read settings/clubChallengeMilestones, using defaults:', e.message);
+            console.warn('Could not read club challenge settings, using defaults:', e.message);
         }
 
         const clubChallengeAccum = {};
@@ -695,6 +931,16 @@ async function syncPlayFabPlayerData() {
             const maxA = [...milestonesConfig.assists].filter(t => sums.assists >= t).pop();
             console.log(`  ${nm}: pooled goals=${sums.goals}${maxG !== undefined ? ` (tier ≥${maxG})` : ''}, assists=${sums.assists}${maxA !== undefined ? ` (tier ≥${maxA})` : ''}`);
         }
+
+        await grantClubChallengeBagRewards({
+            clubs,
+            clubChallengeAccum,
+            milestonesConfig,
+            bagRewardsTiers,
+            bagRewardsEnabled,
+            currentSeason,
+            updates
+        });
 
         // Apply all updates in a single batch
         const allKeys = Object.keys(updates);
