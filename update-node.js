@@ -121,7 +121,8 @@ const API_CONFIG = {
 const PLAYFAB_CONFIG = {
     titleId: process.env.PLAYFAB_TITLE_ID || '',
     secretKey: process.env.PLAYFAB_SECRET_KEY || '',
-    baseUrl: 'https://{titleId}.playfabapi.com'
+    baseUrl: 'https://{titleId}.playfabapi.com',
+    syncIntervalHours: parseInt(process.env.PLAYFAB_SYNC_INTERVAL_HOURS) || 6 // Minimum hours between syncs
 };
 
 // Validate required environment variables
@@ -171,503 +172,17 @@ function getPlayFabUrl(endpoint) {
     return PLAYFAB_CONFIG.baseUrl.replace('{titleId}', PLAYFAB_CONFIG.titleId) + endpoint;
 }
 
-/** Default club challenge tiers (goals / assists); overridden by settings/clubChallengeMilestones when set */
-const DEFAULT_CLUB_CHALLENGE_MILESTONES = {
-    goals: [100, 250, 500, 1000],
-    assists: [100, 250, 500, 1000]
-};
-
 /**
- * Goals track: pooled challengeClubGoals vs settings/clubChallengeMilestones.goals[i] → these bags (GiveRewards-style open_*).
- * Override: settings/clubChallengeBagRewardsGoals (array of { allStarBags, mvpBags }).
- */
-const DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_GOALS = [
-    { allStarBags: 1, mvpBags: 0 },
-    { allStarBags: 2, mvpBags: 0 },
-    { allStarBags: 0, mvpBags: 1 },
-    { allStarBags: 0, mvpBags: 2 }
-];
-
-/**
- * Assists track: pooled challengeClubAssists vs milestones.assists[i] → separate claims & rewards.
- * Override: settings/clubChallengeBagRewardsAssists. If unset, legacy settings/clubChallengeBagRewards applies to BOTH axes.
- */
-const DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_ASSISTS = [
-    { allStarBags: 1, mvpBags: 0 },
-    { allStarBags: 2, mvpBags: 0 },
-    { allStarBags: 0, mvpBags: 1 },
-    { allStarBags: 0, mvpBags: 2 }
-];
-
-/**
- * TESTING: use [] to grant bags to every roster member again.
- * When non-empty, only these PlayFab IDs receive PlayFab increments (normalized uppercase).
- */
-const CLUB_CHALLENGE_BAG_TEST_ONLY_PLAYFAB_IDS = [];
-
-function parsePlayerJsonCareerInt(val) {
-    if (val === undefined || val === null) return null;
-    const n = typeof val === 'number' ? val : parseInt(String(val), 10);
-    return Number.isFinite(n) && n >= 0 ? n : null;
-}
-
-/**
- * RTDB update() rejects undefined anywhere in the payload (e.g. sparse seasons[] or optional fields).
- * Prefer JSON round-trip so sparse arrays, nested undefined, etc. match Firebase validation.
- */
-function sanitizeForFirebaseUpdate(value) {
-    if (value === undefined) return null;
-    try {
-        const json = JSON.stringify(value, (_k, v) => (v === undefined ? null : v));
-        return JSON.parse(json);
-    } catch (_err) {
-        return sanitizeForFirebaseUpdateManual(value);
-    }
-}
-
-function sanitizeForFirebaseUpdateManual(value) {
-    if (value === undefined) return null;
-    if (value === null) return null;
-    if (typeof value !== 'object') return value;
-    if (Array.isArray(value)) {
-        const result = [];
-        for (let i = 0; i < value.length; i++) {
-            result[i] = sanitizeForFirebaseUpdateManual(value[i]);
-        }
-        return result;
-    }
-    const out = {};
-    for (const key of Object.keys(value)) {
-        out[key] = sanitizeForFirebaseUpdateManual(value[key]);
-    }
-    return out;
-}
-
-function parsePlayerJsonOpenBagInt(val) {
-    if (val === undefined || val === null) return 0;
-    const n = typeof val === 'number' ? val : parseInt(String(val), 10);
-    return Number.isFinite(n) && n >= 0 ? n : 0;
-}
-
-/** Refuse bag writes if PLAYER_JSON does not look like a full game blob (prevents `{}` / truncated writes). */
-const PLAYER_JSON_MIN_TOP_LEVEL_KEYS = 24;
-const PLAYER_JSON_ABSOLUTE_MIN_SERIALIZED_LENGTH = 400;
-const PLAYER_JSON_MIN_SERIALIZED_LENGTH_RATIO = 0.75;
-
-function validatePlayerJsonBeforeBagMutation(originalString, parsedObj) {
-    if (typeof originalString !== 'string') {
-        return { ok: false, error: 'PLAYER_JSON Value is not a string' };
-    }
-    if (originalString.length < PLAYER_JSON_ABSOLUTE_MIN_SERIALIZED_LENGTH) {
-        return {
-            ok: false,
-            error: `incoming PLAYER_JSON too short (${originalString.length} chars, min ${PLAYER_JSON_ABSOLUTE_MIN_SERIALIZED_LENGTH})`
-        };
-    }
-    if (typeof parsedObj !== 'object' || parsedObj === null || Array.isArray(parsedObj)) {
-        return { ok: false, error: 'parsed PLAYER_JSON is not a plain object' };
-    }
-    const nKeys = Object.keys(parsedObj).length;
-    if (nKeys < PLAYER_JSON_MIN_TOP_LEVEL_KEYS) {
-        return {
-            ok: false,
-            error: `parsed PLAYER_JSON has only ${nKeys} top-level keys (min ${PLAYER_JSON_MIN_TOP_LEVEL_KEYS})`
-        };
-    }
-    return { ok: true };
-}
-
-function validateSerializedPlayerJsonAfterMutation(originalString, newString) {
-    if (typeof newString !== 'string') {
-        return { ok: false, error: 'serialized PLAYER_JSON is not a string' };
-    }
-    if (newString.length < PLAYER_JSON_ABSOLUTE_MIN_SERIALIZED_LENGTH) {
-        return {
-            ok: false,
-            error: `post-edit PLAYER_JSON too short (${newString.length} chars, min ${PLAYER_JSON_ABSOLUTE_MIN_SERIALIZED_LENGTH})`
-        };
-    }
-    const ratio = newString.length / originalString.length;
-    if (ratio < PLAYER_JSON_MIN_SERIALIZED_LENGTH_RATIO) {
-        return {
-            ok: false,
-            error: `post-edit PLAYER_JSON length ${(ratio * 100).toFixed(1)}% of original (min ${PLAYER_JSON_MIN_SERIALIZED_LENGTH_RATIO * 100}%)`
-        };
-    }
-    try {
-        JSON.parse(newString);
-    } catch (e) {
-        return { ok: false, error: `post-edit JSON invalid: ${e.message}` };
-    }
-    return { ok: true };
-}
-
-function normalizePlayFabIdForStorage(playfabId) {
-    return String(playfabId || '').toUpperCase().replace(/\s/g, '');
-}
-
-/**
- * The first time we actually increment pending bags in PlayFab for a player, store their pre-mutation
- * PLAYER_JSON string in RTDB (one snapshot per PlayFab ID, never overwritten). Skipped for dry runs.
- * Path: playerJsonBagBackupBeforeFirstGrant/{normalizedPlayFabId}
- */
-async function saveFirstBagGrantPlayerJsonBackup(playfabId, originalJsonString) {
-    const id = normalizePlayFabIdForStorage(playfabId);
-    if (!id || typeof originalJsonString !== 'string') return { ok: false, skipped: true };
-
-    try {
-        const ref = database.ref(`playerJsonBagBackupBeforeFirstGrant/${id}`);
-        const tx = await ref.transaction((current) => {
-            if (current != null) {
-                return current;
-            }
-            return {
-                savedAt: admin.database.ServerValue.TIMESTAMP,
-                playFabId: id,
-                /** Full PlayFab USER PLAYER_JSON.Value before any hub bag increment */
-                playerJson: originalJsonString
-            };
-        });
-        return { ok: true, committed: !!tx.committed };
-    } catch (err) {
-        console.warn(`  ⚠️ First-time PLAYER_JSON backup failed for ${id}: ${err.message}`);
-        return { ok: false, error: err.message };
-    }
-}
-
-/** Season bucket on a club document (array or keyed object), same layout as players */
-function getSeasonBucketFromClub(clubData, seasonNum) {
-    const seasons = clubData?.seasons;
-    if (!seasons || typeof seasons !== 'object') return {};
-    const sn = parseInt(String(seasonNum), 10);
-    if (Array.isArray(seasons)) {
-        const raw = seasons[sn];
-        return raw && typeof raw === 'object' ? { ...raw } : {};
-    }
-    const sk = String(seasonNum);
-    const raw = seasons[sk] !== undefined ? seasons[sk] : seasons[seasonNum];
-    return raw && typeof raw === 'object' ? { ...raw } : {};
-}
-
-/** @param {'challengeBagTiersClaimedGoals'|'challengeBagTiersClaimedAssists'} claimField */
-function isChallengeBagTierClaimedForTrack(seasonBucket, claimField, tierIndex) {
-    const c = seasonBucket?.[claimField];
-    if (!c || typeof c !== 'object') return false;
-    return !!(c[tierIndex] || c[String(tierIndex)]);
-}
-
-function normalizeBagRewardsFromSettings(arr, fallbackTiers) {
-    const fb = fallbackTiers || DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_GOALS;
-    if (!Array.isArray(arr)) return fb;
-    const out = arr.map((row) => ({
-        allStarBags: Math.max(0, parseInt(String(row?.allStarBags ?? 0), 10) || 0),
-        mvpBags: Math.max(0, parseInt(String(row?.mvpBags ?? 0), 10) || 0)
-    }));
-    return out.length ? out : fb;
-}
-
-/**
- * Increment PlayFab USER PLAYER_JSON open_allStarBag / open_mvpBag (mirrors GiveRewards pending inventory).
- * Set env SKIP_PLAYFAB_BAG_WRITES=1 to log-only (no UpdateUserData) for cron dry runs.
- */
-async function incrementPlayFabOpenBags(playfabId, allStarDelta, mvpDelta) {
-    if (!PLAYFAB_ENABLED) return { ok: false, error: 'playfab_disabled' };
-    const asd = allStarDelta || 0;
-    const md = mvpDelta || 0;
-    if (asd <= 0 && md <= 0) return { ok: true, skipped: true };
-
-    const bagDryRun =
-        process.env.SKIP_PLAYFAB_BAG_WRITES === '1' || process.env.PLAYFAB_BAG_DRY_RUN === '1';
-
-    try {
-        const getRes = await fetch(getPlayFabUrl('/Server/GetUserData'), {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-SecretKey': PLAYFAB_CONFIG.secretKey
-            },
-            body: JSON.stringify({
-                PlayFabId: playfabId,
-                Keys: ['PLAYER_JSON']
-            })
-        });
-        if (!getRes.ok) {
-            return { ok: false, error: `GetUserData http ${getRes.status}` };
-        }
-        const getBody = await getRes.json();
-        if (getBody.code !== 200 || !getBody.data?.Data?.PLAYER_JSON?.Value) {
-            return { ok: false, error: getBody.errorMessage || 'no PLAYER_JSON user data' };
-        }
-        const originalJsonString = getBody.data.Data.PLAYER_JSON.Value;
-        let pj;
-        try {
-            pj = JSON.parse(originalJsonString);
-        } catch (e) {
-            return { ok: false, error: `PLAYER_JSON parse: ${e.message}` };
-        }
-
-        const pre = validatePlayerJsonBeforeBagMutation(originalJsonString, pj);
-        if (!pre.ok) {
-            return { ok: false, error: `safety: ${pre.error}` };
-        }
-
-        if (!bagDryRun) {
-            await saveFirstBagGrantPlayerJsonBackup(playfabId, originalJsonString);
-        }
-
-        pj.open_allStarBag = parsePlayerJsonOpenBagInt(pj.open_allStarBag) + asd;
-        pj.open_mvpBag = parsePlayerJsonOpenBagInt(pj.open_mvpBag) + md;
-
-        let newJsonString;
-        try {
-            newJsonString = JSON.stringify(pj);
-        } catch (e) {
-            return { ok: false, error: `PLAYER_JSON stringify: ${e.message}` };
-        }
-
-        const post = validateSerializedPlayerJsonAfterMutation(originalJsonString, newJsonString);
-        if (!post.ok) {
-            return { ok: false, error: `safety: ${post.error}` };
-        }
-
-        if (bagDryRun) {
-            console.log(
-                `  [PLAYFAB_BAG_DRY_RUN] would write ${playfabId} (+${asd} all-star, +${md} mvp pending); payload ${newJsonString.length} chars`
-            );
-            return { ok: true, skipped: true, dryRun: true };
-        }
-
-        const putRes = await fetch(getPlayFabUrl('/Server/UpdateUserData'), {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-SecretKey': PLAYFAB_CONFIG.secretKey
-            },
-            body: JSON.stringify({
-                PlayFabId: playfabId,
-                Data: {
-                    PLAYER_JSON: newJsonString
-                },
-                Permission: 'Public'
-            })
-        });
-        if (!putRes.ok) {
-            return { ok: false, error: `UpdateUserData http ${putRes.status}` };
-        }
-        const putBody = await putRes.json();
-        if (putBody.code !== 200) {
-            return { ok: false, error: putBody.errorMessage || String(putBody.code) };
-        }
-        return { ok: true };
-    } catch (err) {
-        return { ok: false, error: err.message };
-    }
-}
-
-/**
- * One axis (goals or assists): pooled total vs that axis milestone list; claims under challengeBagTiersClaimedGoals / …Assists.
- */
-async function grantClubChallengeBagRewardsOneTrack({
-    axisLabel,
-    claimField,
-    pooled,
-    milestoneArr,
-    rewardsTiers,
-    clubId,
-    clubData,
-    seasonBucket,
-    currentSeason,
-    updates,
-    testOnlySet
-}) {
-    const nTiers = Math.min(milestoneArr.length, rewardsTiers.length);
-    if (nTiers <= 0) return { tiersGranted: 0, playfabWrites: 0 };
-
-    let tiersGranted = 0;
-    let playfabWrites = 0;
-
-    for (let tierIdx = 0; tierIdx < nTiers; tierIdx++) {
-        if (pooled < milestoneArr[tierIdx]) continue;
-        if (isChallengeBagTierClaimedForTrack(seasonBucket, claimField, tierIdx)) continue;
-
-        const reward = rewardsTiers[tierIdx];
-        const addAs = reward.allStarBags || 0;
-        const addMvp = reward.mvpBags || 0;
-        if (addAs <= 0 && addMvp <= 0) {
-            updates[`clubs/${clubId}/seasons/${currentSeason}/${claimField}/${tierIdx}`] = true;
-            tiersGranted++;
-            continue;
-        }
-
-        const memberEntries = Object.entries(clubData.players).filter(([, p]) => p?.playfabId);
-        if (memberEntries.length === 0) continue;
-
-        let tierOk = true;
-        let grantTargets = 0;
-        for (const [, playerData] of memberEntries) {
-            const pid = String(playerData.playfabId).toUpperCase().replace(/\s/g, '');
-            if (testOnlySet.size > 0 && !testOnlySet.has(pid)) continue;
-
-            grantTargets++;
-            const r = await incrementPlayFabOpenBags(pid, addAs, addMvp);
-            if (!r.ok) {
-                tierOk = false;
-                console.error(
-                    `  🎁 FAILED ${axisLabel} tier ${tierIdx} club "${clubData.name || clubId}" player ${pid}: ${r.error}`
-                );
-                break;
-            }
-            if (r.dryRun) {
-                tierOk = false;
-                console.log(
-                    `  🎁 PLAYFAB_BAG_DRY_RUN: no PlayFab write / no tier claim (${axisLabel} tier ${tierIdx}, ${clubData.name || clubId}, ${pid})`
-                );
-                break;
-            }
-            playfabWrites++;
-            await new Promise((resolve) => setTimeout(resolve, 35));
-        }
-
-        if ((addAs > 0 || addMvp > 0) && testOnlySet.size > 0 && grantTargets === 0) {
-            tierOk = false;
-            console.warn(
-                `  🎁 TEST MODE (${axisLabel}): none of [${[...testOnlySet].join(', ')}] on roster for "${clubData.name || clubId}" — tier ${tierIdx + 1} not claimed`
-            );
-        }
-
-        if (tierOk) {
-            updates[`clubs/${clubId}/seasons/${currentSeason}/${claimField}/${tierIdx}`] = true;
-            tiersGranted++;
-            const rosterNote =
-                testOnlySet.size > 0
-                    ? `${grantTargets} test account(s) (roster has ${memberEntries.length})`
-                    : `${memberEntries.length} member(s)`;
-            console.log(
-                `  🎁 "${clubData.name || clubId}" [${axisLabel}] tier ${tierIdx + 1}/${nTiers} (pooled≥${milestoneArr[tierIdx]}) → +${addAs} All-Star, +${addMvp} MVP × ${rosterNote}`
-            );
-        }
-    }
-
-    return { tiersGranted, playfabWrites };
-}
-
-/**
- * Goals and assists each have independent milestone tiers and bag rewards (separate RTDB claim maps).
- */
-async function grantClubChallengeBagRewards({
-    clubs,
-    clubChallengeAccum,
-    milestonesConfig,
-    bagRewardsGoals,
-    bagRewardsAssists,
-    bagRewardsEnabled,
-    currentSeason,
-    updates
-}) {
-    if (!bagRewardsEnabled) {
-        console.log('  🎁 Club challenge bag rewards: off (settings/clubChallengeBagRewardsEnabled !== true)');
-        return;
-    }
-    if (!PLAYFAB_ENABLED) {
-        console.log('  🎁 Club challenge bag rewards: skipped (PlayFab not configured)');
-        return;
-    }
-
-    const goalMs = milestonesConfig.goals || [];
-    const astMs = milestonesConfig.assists || [];
-    if (!goalMs.length || !astMs.length) {
-        console.log('  🎁 Club challenge bag rewards: missing goals or assists milestone arrays');
-        return;
-    }
-
-    console.log(
-        '  🎁 Club challenge bag rewards (separate goals vs assists tracks → PlayFab open_allStarBag / open_mvpBag)...'
-    );
-
-    const testOnlySet = new Set(
-        (Array.isArray(CLUB_CHALLENGE_BAG_TEST_ONLY_PLAYFAB_IDS) ? CLUB_CHALLENGE_BAG_TEST_ONLY_PLAYFAB_IDS : [])
-            .map((id) => String(id || '').toUpperCase().replace(/\s/g, ''))
-            .filter(Boolean)
-    );
-    if (testOnlySet.size > 0) {
-        console.log(
-            `  🎁 TEST MODE: PlayFab bag grants only for [${[...testOnlySet].join(', ')}] (set CLUB_CHALLENGE_BAG_TEST_ONLY_PLAYFAB_IDS to [] for full roster)`
-        );
-    }
-
-    let tiersNewlyGranted = 0;
-    let playfabWrites = 0;
-
-    for (const [clubId, clubData] of Object.entries(clubs)) {
-        if (!clubData.players) continue;
-        const sums = clubChallengeAccum[clubId];
-        if (!sums) continue;
-
-        const pg = sums.goals || 0;
-        const pa = sums.assists || 0;
-        const seasonBucket = getSeasonBucketFromClub(clubData, currentSeason);
-
-        const gRes = await grantClubChallengeBagRewardsOneTrack({
-            axisLabel: 'goals',
-            claimField: 'challengeBagTiersClaimedGoals',
-            pooled: pg,
-            milestoneArr: goalMs,
-            rewardsTiers: bagRewardsGoals,
-            clubId,
-            clubData,
-            seasonBucket,
-            currentSeason,
-            updates,
-            testOnlySet
-        });
-        tiersNewlyGranted += gRes.tiersGranted;
-        playfabWrites += gRes.playfabWrites;
-
-        const aRes = await grantClubChallengeBagRewardsOneTrack({
-            axisLabel: 'assists',
-            claimField: 'challengeBagTiersClaimedAssists',
-            pooled: pa,
-            milestoneArr: astMs,
-            rewardsTiers: bagRewardsAssists,
-            clubId,
-            clubData,
-            seasonBucket,
-            currentSeason,
-            updates,
-            testOnlySet
-        });
-        tiersNewlyGranted += aRes.tiersGranted;
-        playfabWrites += aRes.playfabWrites;
-    }
-
-    console.log(
-        `  🎁 Bag rewards summary: ${tiersNewlyGranted} club-track-tier grant(s) recorded, ${playfabWrites} PlayFab update(s)`
-    );
-
-    if (tiersNewlyGranted === 0 && playfabWrites === 0 && testOnlySet.size > 0) {
-        console.log(
-            '  🎁 Hint: with TEST MODE, a club only grants when pooled goals/assists cross a tier AND a test PlayFabId is on that club roster. Reload the game after a grant so PLAYER_JSON refreshes.'
-        );
-    }
-}
-
-/**
- * Fetches PLAYER_JSON from PlayFab Server API: username, career ranked goals (totalPoints), assists (totalAssists).
+ * Fetches a player's profile from PlayFab Server API
+ * Gets the clean username from PLAYER_JSON user data (not DisplayName which has clan tags)
  * @param {string} playfabId - The player's PlayFab ID
- * @returns {{ displayName: string|null, careerGoals: number|null, careerAssists: number|null, diag: Object }}
+ * @returns {Object|null} Player profile with DisplayName (extracted from PLAYER_JSON.username), or null if failed
  */
 async function getPlayFabPlayerProfile(playfabId) {
-    const baseDiag = { playfabId };
-    if (!PLAYFAB_ENABLED) {
-        return {
-            displayName: null,
-            careerGoals: null,
-            careerAssists: null,
-            diag: { ...baseDiag, reason: 'playfab_disabled' }
-        };
-    }
+    if (!PLAYFAB_ENABLED) return null;
 
     try {
+        // Fetch user data to get the clean username from PLAYER_JSON
         const response = await fetch(getPlayFabUrl('/Server/GetUserData'), {
             method: 'POST',
             headers: {
@@ -680,185 +195,28 @@ async function getPlayFabPlayerProfile(playfabId) {
             })
         });
 
-        baseDiag.httpStatus = response.status;
         if (!response.ok) {
-            return {
-                displayName: null,
-                careerGoals: null,
-                careerAssists: null,
-                diag: { ...baseDiag, reason: 'http_not_ok' }
-            };
+            return null;
         }
 
         const result = await response.json();
-        baseDiag.playfabCode = result.code;
-        if (result.code !== 200) {
-            return {
-                displayName: null,
-                careerGoals: null,
-                careerAssists: null,
-                diag: {
-                    ...baseDiag,
-                    reason: 'playfab_api_error',
-                    playfabError: result.errorMessage || result.error || String(result.status)
-                }
-            };
-        }
-
-        const playerJsonVal = result.data?.Data?.PLAYER_JSON?.Value;
-        if (!playerJsonVal) {
-            return {
-                displayName: null,
-                careerGoals: null,
-                careerAssists: null,
-                diag: { ...baseDiag, reason: 'no_player_json_key' }
-            };
-        }
-
-        let playerJson;
-        try {
-            playerJson = JSON.parse(playerJsonVal);
-        } catch (parseError) {
-            console.error(`Error parsing PLAYER_JSON for ${playfabId}:`, parseError.message);
-            return {
-                displayName: null,
-                careerGoals: null,
-                careerAssists: null,
-                diag: { ...baseDiag, reason: 'player_json_string_parse', error: parseError.message }
-            };
-        }
-
-        const careerGoals = parsePlayerJsonCareerInt(playerJson.totalPoints);
-        const careerAssists = parsePlayerJsonCareerInt(playerJson.totalAssists);
-        const displayName = playerJson.username || null;
-
-        let reason = 'ok_challenge_stats';
-        if (careerGoals === null && careerAssists === null) {
-            reason = 'missing_totalPoints_and_totalAssists';
-        } else if (careerGoals === null) {
-            reason = 'missing_or_invalid_totalPoints';
-        } else if (careerAssists === null) {
-            reason = 'missing_or_invalid_totalAssists';
-        }
-
-        return {
-            displayName,
-            careerGoals,
-            careerAssists,
-            diag: {
-                ...baseDiag,
-                reason,
-                rawTotalPoints: playerJson.totalPoints,
-                rawTotalAssists: playerJson.totalAssists
+        if (result.code === 200 && result.data?.Data?.PLAYER_JSON?.Value) {
+            try {
+                const playerJson = JSON.parse(result.data.Data.PLAYER_JSON.Value);
+                // Return an object with DisplayName set to the clean username
+                return {
+                    DisplayName: playerJson.username || null
+                };
+            } catch (parseError) {
+                console.error(`Error parsing PLAYER_JSON for ${playfabId}:`, parseError.message);
+                return null;
             }
-        };
+        }
+        return null;
     } catch (error) {
         console.error(`Error fetching PlayFab profile for ${playfabId}:`, error.message);
-        return {
-            displayName: null,
-            careerGoals: null,
-            careerAssists: null,
-            diag: { ...baseDiag, reason: 'fetch_exception', error: error.message }
-        };
+        return null;
     }
-}
-
-/**
- * Season challenge math: baselines under seasons[S], idempotent season contribution.
- * @returns {{ challengePatch: Object|null, goalsContrib: number, assistsContrib: number, challengeApplied: boolean }}
- */
-function buildChallengeSeasonPatch(playerData, profile, seasonNum) {
-    if (!profile || profile.careerGoals === null || profile.careerAssists === null) {
-        return { challengePatch: null, goalsContrib: 0, assistsContrib: 0, challengeApplied: false };
-    }
-    const cg = profile.careerGoals;
-    const ca = profile.careerAssists;
-    const sn = parseInt(String(seasonNum), 10);
-    const sk = String(seasonNum);
-    const src = playerData.seasons;
-
-    const prevSeas = getSeasonEntryFromPlayer(playerData, seasonNum);
-    let gBaseline = prevSeas.challengeGoalsBaseline;
-    let aBaseline = prevSeas.challengeAssistsBaseline;
-    // Anchor each stat independently if missing (new season / first sync). Do not reset both
-    // when only one baseline exists — that would wipe the stored baseline after schema changes.
-    const hadNoBaselines =
-        prevSeas.challengeGoalsBaseline === undefined && prevSeas.challengeAssistsBaseline === undefined;
-    if (gBaseline === undefined) gBaseline = cg;
-    if (aBaseline === undefined) aBaseline = ca;
-    const firstAnchor = hadNoBaselines;
-    const goalsContrib = Math.max(0, cg - gBaseline);
-    const assistsContrib = Math.max(0, ca - aBaseline);
-
-    const mergedSeasonSlice = {
-        ...prevSeas,
-        challengeGoalsBaseline: gBaseline,
-        challengeAssistsBaseline: aBaseline,
-        challengeSeasonGoals: goalsContrib,
-        challengeSeasonAssists: assistsContrib
-    };
-
-    let seasonsOut;
-    if (Array.isArray(src)) {
-        seasonsOut = [...src];
-        while (seasonsOut.length <= sn) seasonsOut.push(null);
-        const existing = seasonsOut[sn] && typeof seasonsOut[sn] === 'object' ? seasonsOut[sn] : {};
-        seasonsOut[sn] = { ...existing, ...mergedSeasonSlice };
-    } else if (src && typeof src === 'object') {
-        seasonsOut = { ...src };
-        const prior = seasonsOut[sk] !== undefined ? seasonsOut[sk] : seasonsOut[sn];
-        const existing = prior && typeof prior === 'object' ? prior : {};
-        seasonsOut[sk] = { ...existing, ...mergedSeasonSlice };
-    } else {
-        seasonsOut = { [sk]: mergedSeasonSlice };
-    }
-
-    return {
-        challengePatch: {
-            seasons: seasonsOut,
-            playfabCareerGoals: cg,
-            playfabCareerAssists: ca
-        },
-        goalsContrib,
-        assistsContrib,
-        challengeApplied: true,
-        careerGoals: cg,
-        careerAssists: ca,
-        firstAnchor
-    };
-}
-
-function isChallengeSeasonDirty(prevSeasonObj, nextSeasonObj) {
-    if (!nextSeasonObj) return false;
-    if (!prevSeasonObj) return true;
-    return (
-        prevSeasonObj.challengeGoalsBaseline !== nextSeasonObj.challengeGoalsBaseline ||
-        prevSeasonObj.challengeAssistsBaseline !== nextSeasonObj.challengeAssistsBaseline ||
-        prevSeasonObj.challengeSeasonGoals !== nextSeasonObj.challengeSeasonGoals ||
-        prevSeasonObj.challengeSeasonAssists !== nextSeasonObj.challengeSeasonAssists
-    );
-}
-
-/** RTDB: season bucket as object key "9" / 9, or legacy array seasons[seasonNum] */
-function getSeasonEntryFromPlayer(playerData, seasonNum) {
-    const seasons = playerData?.seasons;
-    if (!seasons || typeof seasons !== 'object') return {};
-    const sn = parseInt(String(seasonNum), 10);
-    if (Array.isArray(seasons)) {
-        const raw = seasons[sn];
-        return raw && typeof raw === 'object' ? { ...raw } : {};
-    }
-    const sk = String(seasonNum);
-    const raw = seasons[sk] !== undefined ? seasons[sk] : seasons[seasonNum];
-    return raw && typeof raw === 'object' ? { ...raw } : {};
-}
-
-function getSeasonBucketFromPatchSeasons(seasonsVal, seasonNum) {
-    if (!seasonsVal || typeof seasonsVal !== 'object') return undefined;
-    const sn = parseInt(String(seasonNum), 10);
-    if (Array.isArray(seasonsVal)) return seasonsVal[sn];
-    const sk = String(seasonNum);
-    return seasonsVal[sk] !== undefined ? seasonsVal[sk] : seasonsVal[seasonNum];
 }
 
 /**
@@ -905,7 +263,8 @@ async function getPlayFabPlayerStatistics(playfabId, statisticNames = ['Trophies
 
 /**
  * Fetches player data from PlayFab and updates Firebase for all club players
- * (names, trophies, PLAYER_JSON career stats, club challenges). Runs on every job invocation.
+ * Updates player names and trophy counts from PlayFab
+ * Respects sync interval to avoid excessive API calls
  */
 async function syncPlayFabPlayerData() {
     if (!PLAYFAB_ENABLED) {
@@ -913,18 +272,26 @@ async function syncPlayFabPlayerData() {
         return;
     }
 
+    // Check if enough time has passed since last sync
+    const syncIntervalMs = PLAYFAB_CONFIG.syncIntervalHours * 60 * 60 * 1000;
     const lastSyncSnapshot = await database.ref('config/lastPlayFabSync').once('value');
     const lastSyncTime = lastSyncSnapshot.val();
+    
     if (lastSyncTime) {
-        const hoursAgo = ((Date.now() - new Date(lastSyncTime).getTime()) / (1000 * 60 * 60)).toFixed(1);
-        console.log(`🔄 Starting PlayFab player data sync (previous run ${hoursAgo}h ago)...`);
+        const lastSyncDate = new Date(lastSyncTime);
+        const timeSinceLastSync = Date.now() - lastSyncDate.getTime();
+        const hoursAgo = (timeSinceLastSync / (1000 * 60 * 60)).toFixed(1);
+        
+        if (timeSinceLastSync < syncIntervalMs) {
+            const hoursRemaining = ((syncIntervalMs - timeSinceLastSync) / (1000 * 60 * 60)).toFixed(1);
+            console.log(`⏭️ PlayFab sync skipped (last sync was ${hoursAgo}h ago, next sync in ${hoursRemaining}h)`);
+            return;
+        }
+        console.log(`🔄 Starting PlayFab player data sync (last sync was ${hoursAgo}h ago)...`);
     } else {
-        console.log('🔄 Starting PlayFab player data sync (no prior lastPlayFabSync in config)...');
+        console.log('🔄 Starting PlayFab player data sync (first time)...');
     }
-
-    const rtdbUrl = database?.app?.options?.databaseURL || '(unknown)';
-    console.log(`  Active Firebase RTDB URL (writes go here): ${rtdbUrl}`);
-
+    
     try {
         const clubSnapshot = await database.ref('clubs').once('value');
         const clubs = clubSnapshot.val() || {};
@@ -932,15 +299,6 @@ async function syncPlayFabPlayerData() {
         let updatedPlayers = 0;
         let failedPlayers = 0;
         const updates = {};
-
-        /** @type {Record<string, number>} */
-        const profileDiagCounts = {};
-        /** @type {Record<string, string[]>} */
-        const profileDiagSamples = {};
-        const pushSample = (reason, id) => {
-            if (!profileDiagSamples[reason]) profileDiagSamples[reason] = [];
-            if (profileDiagSamples[reason].length < 8) profileDiagSamples[reason].push(id);
-        };
 
         // Collect all players from all clubs into a flat array for batch processing
         const allPlayers = [];
@@ -954,70 +312,6 @@ async function syncPlayFabPlayerData() {
         
         const totalPlayers = allPlayers.length;
         console.log(`  Found ${totalPlayers} players to sync...`);
-        console.log('  Challenge "seasonΔ" = PLAYFAB career goals/assists minus this season\'s baseline. The first hub sync for a player (or new season) sets baseline = current career, so seasonΔ is 0 until they earn more ranked goals/assists; club bar is the sum of all members\' seasonΔ.');
-
-        let milestonesConfig = DEFAULT_CLUB_CHALLENGE_MILESTONES;
-        let bagRewardsEnabled = true;
-        let bagRewardsGoals = DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_GOALS;
-        let bagRewardsAssists = DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_ASSISTS;
-        try {
-            const [mileSnap, bagEnabledSnap, bagSnapGoals, bagSnapAssists, bagSnapLegacy] = await Promise.all([
-                database.ref('settings/clubChallengeMilestones').once('value'),
-                database.ref('settings/clubChallengeBagRewardsEnabled').once('value'),
-                database.ref('settings/clubChallengeBagRewardsGoals').once('value'),
-                database.ref('settings/clubChallengeBagRewardsAssists').once('value'),
-                database.ref('settings/clubChallengeBagRewards').once('value')
-            ]);
-            if (!mileSnap.exists()) {
-                await database.ref('settings/clubChallengeMilestones').set(DEFAULT_CLUB_CHALLENGE_MILESTONES);
-                milestonesConfig = DEFAULT_CLUB_CHALLENGE_MILESTONES;
-            } else {
-                const m = mileSnap.val();
-                if (m && typeof m === 'object') {
-                    milestonesConfig = {
-                        goals: Array.isArray(m.goals) && m.goals.length ? m.goals.map(Number).filter(n => Number.isFinite(n) && n > 0) : DEFAULT_CLUB_CHALLENGE_MILESTONES.goals,
-                        assists: Array.isArray(m.assists) && m.assists.length ? m.assists.map(Number).filter(n => Number.isFinite(n) && n > 0) : DEFAULT_CLUB_CHALLENGE_MILESTONES.assists
-                    };
-                }
-            }
-            if (bagEnabledSnap.exists() && bagEnabledSnap.val() === false) {
-                bagRewardsEnabled = false;
-            }
-            const hasGoalsSnap = bagSnapGoals.exists() && bagSnapGoals.val() != null;
-            const hasAssistsSnap = bagSnapAssists.exists() && bagSnapAssists.val() != null;
-            const hasLegacy = bagSnapLegacy.exists() && bagSnapLegacy.val() != null;
-            if (hasGoalsSnap) {
-                bagRewardsGoals = normalizeBagRewardsFromSettings(
-                    bagSnapGoals.val(),
-                    DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_GOALS
-                );
-            } else if (hasLegacy) {
-                bagRewardsGoals = normalizeBagRewardsFromSettings(
-                    bagSnapLegacy.val(),
-                    DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_GOALS
-                );
-            }
-            if (hasAssistsSnap) {
-                bagRewardsAssists = normalizeBagRewardsFromSettings(
-                    bagSnapAssists.val(),
-                    DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_ASSISTS
-                );
-            } else if (hasLegacy) {
-                bagRewardsAssists = normalizeBagRewardsFromSettings(
-                    bagSnapLegacy.val(),
-                    DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_ASSISTS
-                );
-            }
-        } catch (e) {
-            console.warn('Could not read club challenge settings, using defaults:', e.message);
-        }
-
-        const clubChallengeAccum = {};
-        for (const [cid, cdata] of Object.entries(clubs)) {
-            if (cdata.players && Object.keys(cdata.players).length > 0) {
-                clubChallengeAccum[cid] = { goals: 0, assists: 0 };
-            }
-        }
         
         // Process players in parallel batches for speed
         const BATCH_SIZE = 10; // Process 10 players at a time
@@ -1030,72 +324,42 @@ async function syncPlayFabPlayerData() {
                 batch.map(async ({ clubId, playerKey, playerData }) => {
                     const normalizedId = playerData.playfabId.toUpperCase().replace(/\s/g, '');
                     
-                    const [pf, statistics] = await Promise.all([
+                    // Fetch profile and statistics in parallel
+                    const [profile, statistics] = await Promise.all([
                         getPlayFabPlayerProfile(normalizedId),
                         getPlayFabPlayerStatistics(normalizedId, ['NUM_TROPHIES_SEASON'])
                     ]);
 
-                    const reason = pf.diag?.reason || 'unknown';
-                    profileDiagCounts[reason] = (profileDiagCounts[reason] || 0) + 1;
-                    pushSample(reason, normalizedId);
-
-                    const profile =
-                        pf.careerGoals !== null && pf.careerAssists !== null
-                            ? {
-                                DisplayName: pf.displayName,
-                                careerGoals: pf.careerGoals,
-                                careerAssists: pf.careerAssists
-                            }
-                            : null;
-
                     let hasUpdates = false;
                     const playerUpdates = {};
 
-                    if (pf.displayName && pf.displayName !== playerData.name) {
-                        playerUpdates.name = pf.displayName;
+                    // Update display name if available and different
+                    if (profile?.DisplayName && profile.DisplayName !== playerData.name) {
+                        playerUpdates.name = profile.DisplayName;
                         hasUpdates = true;
                     }
 
+                    // Update trophy count if available (statistic is named NUM_TROPHIES_SEASON in PlayFab)
+                    // Always include trophy count so we can sync to global players table
                     if (statistics?.NUM_TROPHIES_SEASON !== undefined) {
                         const newTrophyCount = statistics.NUM_TROPHIES_SEASON;
                         playerUpdates.trophyCount = newTrophyCount;
+                        // Only mark hasUpdates for club if value changed (avoid unnecessary club writes)
                         if (newTrophyCount !== playerData.trophyCount) {
                             hasUpdates = true;
                         }
                     }
 
-                    const ch = buildChallengeSeasonPatch(playerData, profile, currentSeason);
-                    let writeChallenge = false;
-                    if (ch.challengeApplied && ch.challengePatch) {
-                        const prevS = getSeasonEntryFromPlayer(playerData, currentSeason);
-                        const nextS = getSeasonBucketFromPatchSeasons(ch.challengePatch.seasons, currentSeason);
-                        writeChallenge = isChallengeSeasonDirty(prevS, nextS) ||
-                            playerData.playfabCareerGoals !== ch.challengePatch.playfabCareerGoals ||
-                            playerData.playfabCareerAssists !== ch.challengePatch.playfabCareerAssists;
-                        if (clubChallengeAccum[clubId]) {
-                            clubChallengeAccum[clubId].goals += ch.goalsContrib;
-                            clubChallengeAccum[clubId].assists += ch.assistsContrib;
-                        }
-                    }
-
-                    return {
-                        clubId,
-                        playerKey,
-                        playerData,
-                        normalizedId,
-                        playerUpdates,
-                        hasUpdates,
-                        ch,
-                        writeChallenge
-                    };
+                    return { clubId, playerKey, playerData, normalizedId, playerUpdates, hasUpdates };
                 })
             );
             
             // Process batch results
             for (const result of batchResults) {
                 if (result.status === 'fulfilled') {
-                    const { clubId, playerKey, playerData, normalizedId, playerUpdates, hasUpdates, ch, writeChallenge } = result.value;
+                    const { clubId, playerKey, playerData, normalizedId, playerUpdates, hasUpdates } = result.value;
                     
+                    // Always update global players table if we have trophy data (even if club data unchanged)
                     if (playerUpdates.trophyCount !== undefined) {
                         updates[`players/${normalizedId}/trophyCount`] = playerUpdates.trophyCount;
                         updates[`players/${normalizedId}/seasons/${currentSeason}/trophyCount`] = playerUpdates.trophyCount;
@@ -1103,35 +367,17 @@ async function syncPlayFabPlayerData() {
                     if (playerUpdates.name) {
                         updates[`players/${normalizedId}/name`] = playerUpdates.name;
                     }
-
-                    if (ch.challengeApplied && ch.challengePatch) {
-                        updates[`players/${normalizedId}/playfabCareerGoals`] = ch.challengePatch.playfabCareerGoals;
-                        updates[`players/${normalizedId}/playfabCareerAssists`] = ch.challengePatch.playfabCareerAssists;
-                        updates[`players/${normalizedId}/seasons/${currentSeason}/challengeSeasonGoals`] = ch.goalsContrib;
-                        updates[`players/${normalizedId}/seasons/${currentSeason}/challengeSeasonAssists`] = ch.assistsContrib;
-                    }
-
-                    const shouldWriteClubPlayer = hasUpdates || writeChallenge;
-                    if (shouldWriteClubPlayer) {
-                        const merged = {
+                    
+                    if (hasUpdates) {
+                        // Queue updates for club player data (only if changed)
+                        updates[`clubs/${clubId}/players/${playerKey}`] = {
                             ...playerData,
                             ...playerUpdates,
-                            ...(ch.challengeApplied && ch.challengePatch ? ch.challengePatch : {}),
                             lastPlayFabSync: new Date().toISOString()
                         };
-                        updates[`clubs/${clubId}/players/${playerKey}`] = merged;
-
+                        
                         updatedPlayers++;
-                        const parts = [];
-                        if (playerUpdates.name) parts.push(`name="${playerUpdates.name}"`);
-                        if (playerUpdates.trophyCount !== undefined) parts.push(`trophies=${playerUpdates.trophyCount}`);
-                        if (writeChallenge) {
-                            const anchorNote = ch.firstAnchor ? 'first-anchor' : 'baseline';
-                            parts.push(
-                                `challenges PLAYFAB career goals=${ch.careerGoals} assists=${ch.careerAssists} | seasonΔ goals=${ch.goalsContrib} assists=${ch.assistsContrib} (${anchorNote})`
-                            );
-                        }
-                        console.log(`  ✓ ${normalizedId}: ${parts.join(' ')}`.trim() || `  ✓ ${normalizedId}: (sync)`);
+                        console.log(`  ✓ ${normalizedId}: ${playerUpdates.name ? `name="${playerUpdates.name}"` : ''} ${playerUpdates.trophyCount !== undefined ? `trophies=${playerUpdates.trophyCount}` : ''}`);
                     }
                 } else {
                     console.error(`  ✗ Failed to sync player: ${result.reason?.message || 'Unknown error'}`);
@@ -1145,73 +391,20 @@ async function syncPlayFabPlayerData() {
             }
         }
 
-        console.log('📊 PLAYER_JSON / PlayFab career diagnostics (per roster player):');
-        const sortedReasons = Object.entries(profileDiagCounts).sort((a, b) => b[1] - a[1]);
-        for (const [r, c] of sortedReasons) {
-            const samp =
-                profileDiagSamples[r]?.length > 0 ? ` | samples: ${profileDiagSamples[r].join(', ')}` : '';
-            console.log(`    ${r}: ${c}${samp}`);
-        }
-        const okChallenge = profileDiagCounts.ok_challenge_stats || 0;
-        if (okChallenge === 0) {
-            console.warn(
-                '  ⚠️ No players had both totalPoints and totalAssists parseable in PLAYER_JSON — playfabCareerGoals will not be written. Check game client keys / PlayFab User Data.'
-            );
-        }
-
-        console.log('⚽ Club challenge rollups (pooled season totals)...');
-        for (const [clubId, sums] of Object.entries(clubChallengeAccum)) {
-            updates[`clubs/${clubId}/seasons/${currentSeason}/challengeClubGoals`] = sums.goals;
-            updates[`clubs/${clubId}/seasons/${currentSeason}/challengeClubAssists`] = sums.assists;
-            const nm = clubs[clubId]?.name || clubId;
-            const maxG = [...milestonesConfig.goals].filter(t => sums.goals >= t).pop();
-            const maxA = [...milestonesConfig.assists].filter(t => sums.assists >= t).pop();
-            console.log(`  ${nm}: pooled goals=${sums.goals}${maxG !== undefined ? ` (tier ≥${maxG})` : ''}, assists=${sums.assists}${maxA !== undefined ? ` (tier ≥${maxA})` : ''}`);
-        }
-
-        await grantClubChallengeBagRewards({
-            clubs,
-            clubChallengeAccum,
-            milestonesConfig,
-            bagRewardsGoals,
-            bagRewardsAssists,
-            bagRewardsEnabled,
-            currentSeason,
-            updates
-        });
-
         // Apply all updates in a single batch
-        const allKeys = Object.keys(updates);
-        const careerGoalPaths = allKeys.filter(k => k.endsWith('/playfabCareerGoals'));
-        const careerAssistPaths = allKeys.filter(k => k.endsWith('/playfabCareerAssists'));
-        const challengeSeasonGoalPaths = allKeys.filter(k => k.endsWith(`/challengeSeasonGoals`));
-        console.log(
-            `  RTDB multi-path queue: total paths=${allKeys.length}, playfabCareerGoals=${careerGoalPaths.length}, playfabCareerAssists=${careerAssistPaths.length}, seasons/${currentSeason}/challengeSeasonGoals=${challengeSeasonGoalPaths.length}`
-        );
-
         if (Object.keys(updates).length > 0) {
+            // Process updates in batches to avoid Firebase limits
             const updateEntries = Object.entries(updates);
             const batchSize = 100;
-
-            try {
-                for (let i = 0; i < updateEntries.length; i += batchSize) {
-                    const batch = updateEntries.slice(i, i + batchSize);
-                    const batchUpdates = Object.fromEntries(
-                        batch.map(([path, val]) => [path, sanitizeForFirebaseUpdate(val)])
-                    );
-                    await database.ref().update(batchUpdates);
-                }
-                console.log(`  Firebase ref.update(): OK (${updateEntries.length} paths in ${Math.ceil(updateEntries.length / batchSize)} chunk(s))`);
-            } catch (fbErr) {
-                console.error('  Firebase ref.update() FAILED:', fbErr.message || fbErr);
-                if (fbErr.code) console.error('  Firebase error code:', fbErr.code);
-                throw fbErr;
+            
+            for (let i = 0; i < updateEntries.length; i += batchSize) {
+                const batch = updateEntries.slice(i, i + batchSize);
+                const batchUpdates = Object.fromEntries(batch);
+                await database.ref().update(batchUpdates);
             }
-        } else {
-            console.log('  No RTDB paths to write this run.');
         }
 
-        console.log(`✅ PlayFab sync complete: ${updatedPlayers}/${totalPlayers} club roster rows updated (name/trophy/challenge delta), ${failedPlayers} failed`);
+        console.log(`✅ PlayFab sync complete: ${updatedPlayers}/${totalPlayers} players updated, ${failedPlayers} failed`);
 
         // Now update club total trophies by summing all player trophy counts
         console.log('🏆 Updating club total trophies...');
@@ -1255,17 +448,14 @@ async function syncPlayFabPlayerData() {
         
         // Apply club trophy updates
         if (Object.keys(clubTrophyUpdates).length > 0) {
-            const sanitizedTrophies = Object.fromEntries(
-                Object.entries(clubTrophyUpdates).map(([p, v]) => [p, sanitizeForFirebaseUpdate(v)])
-            );
-            await database.ref().update(sanitizedTrophies);
+            await database.ref().update(clubTrophyUpdates);
         }
         
         console.log(`✅ Club trophies updated: ${clubsUpdated} clubs`);
         
-        // Save the last successful sync timestamp (for logs / ops; sync is not interval-gated)
+        // Save the last sync timestamp
         await database.ref('config/lastPlayFabSync').set(new Date().toISOString());
-        console.log('📅 config/lastPlayFabSync updated');
+        console.log(`📅 Next PlayFab sync available in ${PLAYFAB_CONFIG.syncIntervalHours} hours`);
         
     } catch (error) {
         console.error('Error during PlayFab sync:', error);
