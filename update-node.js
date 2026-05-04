@@ -178,11 +178,21 @@ const DEFAULT_CLUB_CHALLENGE_MILESTONES = {
 };
 
 /**
- * When pooled club season goals AND assists both reach milestones.goals[i] & milestones.assists[i],
- * grant these pending bags (same as game GiveRewards → open_*). Index aligns with milestone tier.
- * Override via settings/clubChallengeBagRewards (array of { allStarBags, mvpBags }).
+ * Goals track: pooled challengeClubGoals vs settings/clubChallengeMilestones.goals[i] → these bags (GiveRewards-style open_*).
+ * Override: settings/clubChallengeBagRewardsGoals (array of { allStarBags, mvpBags }).
  */
-const DEFAULT_CLUB_CHALLENGE_BAG_REWARDS = [
+const DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_GOALS = [
+    { allStarBags: 1, mvpBags: 0 },
+    { allStarBags: 2, mvpBags: 0 },
+    { allStarBags: 0, mvpBags: 1 },
+    { allStarBags: 0, mvpBags: 2 }
+];
+
+/**
+ * Assists track: pooled challengeClubAssists vs milestones.assists[i] → separate claims & rewards.
+ * Override: settings/clubChallengeBagRewardsAssists. If unset, legacy settings/clubChallengeBagRewards applies to BOTH axes.
+ */
+const DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_ASSISTS = [
     { allStarBags: 1, mvpBags: 0 },
     { allStarBags: 2, mvpBags: 0 },
     { allStarBags: 0, mvpBags: 1 },
@@ -253,19 +263,21 @@ function getSeasonBucketFromClub(clubData, seasonNum) {
     return raw && typeof raw === 'object' ? { ...raw } : {};
 }
 
-function isChallengeBagTierClaimed(seasonBucket, tierIndex) {
-    const c = seasonBucket?.challengeBagTiersClaimed;
+/** @param {'challengeBagTiersClaimedGoals'|'challengeBagTiersClaimedAssists'} claimField */
+function isChallengeBagTierClaimedForTrack(seasonBucket, claimField, tierIndex) {
+    const c = seasonBucket?.[claimField];
     if (!c || typeof c !== 'object') return false;
     return !!(c[tierIndex] || c[String(tierIndex)]);
 }
 
-function normalizeBagRewardsFromSettings(arr) {
-    if (!Array.isArray(arr)) return DEFAULT_CLUB_CHALLENGE_BAG_REWARDS;
+function normalizeBagRewardsFromSettings(arr, fallbackTiers) {
+    const fb = fallbackTiers || DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_GOALS;
+    if (!Array.isArray(arr)) return fb;
     const out = arr.map((row) => ({
         allStarBags: Math.max(0, parseInt(String(row?.allStarBags ?? 0), 10) || 0),
         mvpBags: Math.max(0, parseInt(String(row?.mvpBags ?? 0), 10) || 0)
     }));
-    return out.length ? out : DEFAULT_CLUB_CHALLENGE_BAG_REWARDS;
+    return out.length ? out : fb;
 }
 
 /**
@@ -333,13 +345,94 @@ async function incrementPlayFabOpenBags(playfabId, allStarDelta, mvpDelta) {
 }
 
 /**
- * When pooled goals & assists both hit milestone tier i, grant bagRewardsTiers[i] to every roster member via PlayFab.
+ * One axis (goals or assists): pooled total vs that axis milestone list; claims under challengeBagTiersClaimedGoals / …Assists.
+ */
+async function grantClubChallengeBagRewardsOneTrack({
+    axisLabel,
+    claimField,
+    pooled,
+    milestoneArr,
+    rewardsTiers,
+    clubId,
+    clubData,
+    seasonBucket,
+    currentSeason,
+    updates,
+    testOnlySet
+}) {
+    const nTiers = Math.min(milestoneArr.length, rewardsTiers.length);
+    if (nTiers <= 0) return { tiersGranted: 0, playfabWrites: 0 };
+
+    let tiersGranted = 0;
+    let playfabWrites = 0;
+
+    for (let tierIdx = 0; tierIdx < nTiers; tierIdx++) {
+        if (pooled < milestoneArr[tierIdx]) continue;
+        if (isChallengeBagTierClaimedForTrack(seasonBucket, claimField, tierIdx)) continue;
+
+        const reward = rewardsTiers[tierIdx];
+        const addAs = reward.allStarBags || 0;
+        const addMvp = reward.mvpBags || 0;
+        if (addAs <= 0 && addMvp <= 0) {
+            updates[`clubs/${clubId}/seasons/${currentSeason}/${claimField}/${tierIdx}`] = true;
+            tiersGranted++;
+            continue;
+        }
+
+        const memberEntries = Object.entries(clubData.players).filter(([, p]) => p?.playfabId);
+        if (memberEntries.length === 0) continue;
+
+        let tierOk = true;
+        let grantTargets = 0;
+        for (const [, playerData] of memberEntries) {
+            const pid = String(playerData.playfabId).toUpperCase().replace(/\s/g, '');
+            if (testOnlySet.size > 0 && !testOnlySet.has(pid)) continue;
+
+            grantTargets++;
+            const r = await incrementPlayFabOpenBags(pid, addAs, addMvp);
+            playfabWrites++;
+            if (!r.ok) {
+                tierOk = false;
+                console.error(
+                    `  🎁 FAILED ${axisLabel} tier ${tierIdx} club "${clubData.name || clubId}" player ${pid}: ${r.error}`
+                );
+                break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 35));
+        }
+
+        if ((addAs > 0 || addMvp > 0) && testOnlySet.size > 0 && grantTargets === 0) {
+            tierOk = false;
+            console.warn(
+                `  🎁 TEST MODE (${axisLabel}): none of [${[...testOnlySet].join(', ')}] on roster for "${clubData.name || clubId}" — tier ${tierIdx + 1} not claimed`
+            );
+        }
+
+        if (tierOk) {
+            updates[`clubs/${clubId}/seasons/${currentSeason}/${claimField}/${tierIdx}`] = true;
+            tiersGranted++;
+            const rosterNote =
+                testOnlySet.size > 0
+                    ? `${grantTargets} test account(s) (roster has ${memberEntries.length})`
+                    : `${memberEntries.length} member(s)`;
+            console.log(
+                `  🎁 "${clubData.name || clubId}" [${axisLabel}] tier ${tierIdx + 1}/${nTiers} (pooled≥${milestoneArr[tierIdx]}) → +${addAs} All-Star, +${addMvp} MVP × ${rosterNote}`
+            );
+        }
+    }
+
+    return { tiersGranted, playfabWrites };
+}
+
+/**
+ * Goals and assists each have independent milestone tiers and bag rewards (separate RTDB claim maps).
  */
 async function grantClubChallengeBagRewards({
     clubs,
     clubChallengeAccum,
     milestonesConfig,
-    bagRewardsTiers,
+    bagRewardsGoals,
+    bagRewardsAssists,
     bagRewardsEnabled,
     currentSeason,
     updates
@@ -355,13 +448,14 @@ async function grantClubChallengeBagRewards({
 
     const goalMs = milestonesConfig.goals || [];
     const astMs = milestonesConfig.assists || [];
-    const nTiers = Math.min(goalMs.length, astMs.length, bagRewardsTiers.length);
-    if (nTiers <= 0) {
-        console.log('  🎁 Club challenge bag rewards: no aligned tiers (check milestones vs clubChallengeBagRewards length)');
+    if (!goalMs.length || !astMs.length) {
+        console.log('  🎁 Club challenge bag rewards: missing goals or assists milestone arrays');
         return;
     }
 
-    console.log('  🎁 Club challenge bag rewards (PlayFab PLAYER_JSON open_allStarBag / open_mvpBag)...');
+    console.log(
+        '  🎁 Club challenge bag rewards (separate goals vs assists tracks → PlayFab open_allStarBag / open_mvpBag)...'
+    );
 
     const testOnlySet = new Set(
         (Array.isArray(CLUB_CHALLENGE_BAG_TEST_ONLY_PLAYFAB_IDS) ? CLUB_CHALLENGE_BAG_TEST_ONLY_PLAYFAB_IDS : [])
@@ -386,65 +480,48 @@ async function grantClubChallengeBagRewards({
         const pa = sums.assists || 0;
         const seasonBucket = getSeasonBucketFromClub(clubData, currentSeason);
 
-        for (let tierIdx = 0; tierIdx < nTiers; tierIdx++) {
-            if (pg < goalMs[tierIdx] || pa < astMs[tierIdx]) continue;
-            if (isChallengeBagTierClaimed(seasonBucket, tierIdx)) continue;
+        const gRes = await grantClubChallengeBagRewardsOneTrack({
+            axisLabel: 'goals',
+            claimField: 'challengeBagTiersClaimedGoals',
+            pooled: pg,
+            milestoneArr: goalMs,
+            rewardsTiers: bagRewardsGoals,
+            clubId,
+            clubData,
+            seasonBucket,
+            currentSeason,
+            updates,
+            testOnlySet
+        });
+        tiersNewlyGranted += gRes.tiersGranted;
+        playfabWrites += gRes.playfabWrites;
 
-            const reward = bagRewardsTiers[tierIdx];
-            const addAs = reward.allStarBags || 0;
-            const addMvp = reward.mvpBags || 0;
-            if (addAs <= 0 && addMvp <= 0) {
-                updates[`clubs/${clubId}/seasons/${currentSeason}/challengeBagTiersClaimed/${tierIdx}`] = true;
-                tiersNewlyGranted++;
-                continue;
-            }
-
-            const memberEntries = Object.entries(clubData.players).filter(([, p]) => p?.playfabId);
-            if (memberEntries.length === 0) continue;
-
-            let tierOk = true;
-            let grantTargets = 0;
-            for (const [, playerData] of memberEntries) {
-                const pid = String(playerData.playfabId).toUpperCase().replace(/\s/g, '');
-                if (testOnlySet.size > 0 && !testOnlySet.has(pid)) continue;
-
-                grantTargets++;
-                const r = await incrementPlayFabOpenBags(pid, addAs, addMvp);
-                playfabWrites++;
-                if (!r.ok) {
-                    tierOk = false;
-                    console.error(
-                        `  🎁 FAILED bag tier ${tierIdx} club "${clubData.name || clubId}" player ${pid}: ${r.error}`
-                    );
-                    break;
-                }
-                await new Promise((resolve) => setTimeout(resolve, 35));
-            }
-
-            if ((addAs > 0 || addMvp > 0) && testOnlySet.size > 0 && grantTargets === 0) {
-                tierOk = false;
-                console.warn(
-                    `  🎁 TEST MODE: none of [${[...testOnlySet].join(', ')}] on roster for "${clubData.name || clubId}" — tier ${tierIdx + 1} not claimed`
-                );
-            }
-
-            if (tierOk) {
-                updates[`clubs/${clubId}/seasons/${currentSeason}/challengeBagTiersClaimed/${tierIdx}`] = true;
-                tiersNewlyGranted++;
-                const rosterNote =
-                    testOnlySet.size > 0
-                        ? `${grantTargets} test account(s) (roster has ${memberEntries.length})`
-                        : `${memberEntries.length} member(s)`;
-                console.log(
-                    `  🎁 "${clubData.name || clubId}": milestone tier ${tierIdx + 1}/${nTiers} → +${addAs} All-Star bag(s), +${addMvp} MVP bag(s) × ${rosterNote}`
-                );
-            }
-        }
+        const aRes = await grantClubChallengeBagRewardsOneTrack({
+            axisLabel: 'assists',
+            claimField: 'challengeBagTiersClaimedAssists',
+            pooled: pa,
+            milestoneArr: astMs,
+            rewardsTiers: bagRewardsAssists,
+            clubId,
+            clubData,
+            seasonBucket,
+            currentSeason,
+            updates,
+            testOnlySet
+        });
+        tiersNewlyGranted += aRes.tiersGranted;
+        playfabWrites += aRes.playfabWrites;
     }
 
     console.log(
-        `  🎁 Bag rewards summary: ${tiersNewlyGranted} club-tier grant(s) recorded, ${playfabWrites} PlayFab update(s)`
+        `  🎁 Bag rewards summary: ${tiersNewlyGranted} club-track-tier grant(s) recorded, ${playfabWrites} PlayFab update(s)`
     );
+
+    if (tiersNewlyGranted === 0 && playfabWrites === 0 && testOnlySet.size > 0) {
+        console.log(
+            '  🎁 Hint: with TEST MODE, a club only grants when pooled goals/assists cross a tier AND a test PlayFabId is on that club roster. Reload the game after a grant so PLAYER_JSON refreshes.'
+        );
+    }
 }
 
 /**
@@ -754,11 +831,14 @@ async function syncPlayFabPlayerData() {
 
         let milestonesConfig = DEFAULT_CLUB_CHALLENGE_MILESTONES;
         let bagRewardsEnabled = true;
-        let bagRewardsTiers = DEFAULT_CLUB_CHALLENGE_BAG_REWARDS;
+        let bagRewardsGoals = DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_GOALS;
+        let bagRewardsAssists = DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_ASSISTS;
         try {
-            const [mileSnap, bagEnabledSnap, bagRewardsSnap] = await Promise.all([
+            const [mileSnap, bagEnabledSnap, bagSnapGoals, bagSnapAssists, bagSnapLegacy] = await Promise.all([
                 database.ref('settings/clubChallengeMilestones').once('value'),
                 database.ref('settings/clubChallengeBagRewardsEnabled').once('value'),
+                database.ref('settings/clubChallengeBagRewardsGoals').once('value'),
+                database.ref('settings/clubChallengeBagRewardsAssists').once('value'),
                 database.ref('settings/clubChallengeBagRewards').once('value')
             ]);
             if (!mileSnap.exists()) {
@@ -776,8 +856,30 @@ async function syncPlayFabPlayerData() {
             if (bagEnabledSnap.exists() && bagEnabledSnap.val() === false) {
                 bagRewardsEnabled = false;
             }
-            if (bagRewardsSnap.exists() && bagRewardsSnap.val() != null) {
-                bagRewardsTiers = normalizeBagRewardsFromSettings(bagRewardsSnap.val());
+            const hasGoalsSnap = bagSnapGoals.exists() && bagSnapGoals.val() != null;
+            const hasAssistsSnap = bagSnapAssists.exists() && bagSnapAssists.val() != null;
+            const hasLegacy = bagSnapLegacy.exists() && bagSnapLegacy.val() != null;
+            if (hasGoalsSnap) {
+                bagRewardsGoals = normalizeBagRewardsFromSettings(
+                    bagSnapGoals.val(),
+                    DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_GOALS
+                );
+            } else if (hasLegacy) {
+                bagRewardsGoals = normalizeBagRewardsFromSettings(
+                    bagSnapLegacy.val(),
+                    DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_GOALS
+                );
+            }
+            if (hasAssistsSnap) {
+                bagRewardsAssists = normalizeBagRewardsFromSettings(
+                    bagSnapAssists.val(),
+                    DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_ASSISTS
+                );
+            } else if (hasLegacy) {
+                bagRewardsAssists = normalizeBagRewardsFromSettings(
+                    bagSnapLegacy.val(),
+                    DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_ASSISTS
+                );
             }
         } catch (e) {
             console.warn('Could not read club challenge settings, using defaults:', e.message);
@@ -944,7 +1046,8 @@ async function syncPlayFabPlayerData() {
             clubs,
             clubChallengeAccum,
             milestonesConfig,
-            bagRewardsTiers,
+            bagRewardsGoals,
+            bagRewardsAssists,
             bagRewardsEnabled,
             currentSeason,
             updates
