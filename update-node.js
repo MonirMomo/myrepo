@@ -121,7 +121,8 @@ const API_CONFIG = {
 const PLAYFAB_CONFIG = {
     titleId: process.env.PLAYFAB_TITLE_ID || '',
     secretKey: process.env.PLAYFAB_SECRET_KEY || '',
-    baseUrl: 'https://{titleId}.playfabapi.com'
+    baseUrl: 'https://{titleId}.playfabapi.com',
+    syncIntervalHours: parseInt(process.env.PLAYFAB_SYNC_INTERVAL_HOURS) || 6 // Minimum hours between syncs
 };
 
 // Validate required environment variables
@@ -171,27 +172,17 @@ function getPlayFabUrl(endpoint) {
     return PLAYFAB_CONFIG.baseUrl.replace('{titleId}', PLAYFAB_CONFIG.titleId) + endpoint;
 }
 
-/** Default club challenge tiers (goals / assists); overridden by settings/clubChallengeMilestones when set */
-const DEFAULT_CLUB_CHALLENGE_MILESTONES = {
-    goals: [100, 250, 500, 1000],
-    assists: [100, 250, 500, 1000]
-};
-
-function parsePlayerJsonCareerInt(val) {
-    if (val === undefined || val === null) return null;
-    const n = typeof val === 'number' ? val : parseInt(String(val), 10);
-    return Number.isFinite(n) && n >= 0 ? n : null;
-}
-
 /**
- * Fetches PLAYER_JSON from PlayFab Server API: username, career ranked goals (totalPoints), assists (totalAssists).
+ * Fetches a player's profile from PlayFab Server API
+ * Gets the clean username from PLAYER_JSON user data (not DisplayName which has clan tags)
  * @param {string} playfabId - The player's PlayFab ID
- * @returns {Object|null} { DisplayName, careerGoals, careerAssists } or null if failed / missing blob
+ * @returns {Object|null} Player profile with DisplayName (extracted from PLAYER_JSON.username), or null if failed
  */
 async function getPlayFabPlayerProfile(playfabId) {
     if (!PLAYFAB_ENABLED) return null;
 
     try {
+        // Fetch user data to get the clean username from PLAYER_JSON
         const response = await fetch(getPlayFabUrl('/Server/GetUserData'), {
             method: 'POST',
             headers: {
@@ -212,12 +203,9 @@ async function getPlayFabPlayerProfile(playfabId) {
         if (result.code === 200 && result.data?.Data?.PLAYER_JSON?.Value) {
             try {
                 const playerJson = JSON.parse(result.data.Data.PLAYER_JSON.Value);
-                const careerGoals = parsePlayerJsonCareerInt(playerJson.totalPoints);
-                const careerAssists = parsePlayerJsonCareerInt(playerJson.totalAssists);
+                // Return an object with DisplayName set to the clean username
                 return {
-                    DisplayName: playerJson.username || null,
-                    careerGoals,
-                    careerAssists
+                    DisplayName: playerJson.username || null
                 };
             } catch (parseError) {
                 console.error(`Error parsing PLAYER_JSON for ${playfabId}:`, parseError.message);
@@ -229,102 +217,6 @@ async function getPlayFabPlayerProfile(playfabId) {
         console.error(`Error fetching PlayFab profile for ${playfabId}:`, error.message);
         return null;
     }
-}
-
-/**
- * Season challenge math: baselines under seasons[S], idempotent season contribution.
- * @returns {{ challengePatch: Object|null, goalsContrib: number, assistsContrib: number, challengeApplied: boolean }}
- */
-function buildChallengeSeasonPatch(playerData, profile, seasonNum) {
-    if (!profile || profile.careerGoals === null || profile.careerAssists === null) {
-        return { challengePatch: null, goalsContrib: 0, assistsContrib: 0, challengeApplied: false };
-    }
-    const cg = profile.careerGoals;
-    const ca = profile.careerAssists;
-    const sn = parseInt(String(seasonNum), 10);
-    const sk = String(seasonNum);
-    const src = playerData.seasons;
-
-    const prevSeas = getSeasonEntryFromPlayer(playerData, seasonNum);
-    let gBaseline = prevSeas.challengeGoalsBaseline;
-    let aBaseline = prevSeas.challengeAssistsBaseline;
-    const firstAnchor = gBaseline === undefined || aBaseline === undefined;
-    if (firstAnchor) {
-        gBaseline = cg;
-        aBaseline = ca;
-    }
-    const goalsContrib = Math.max(0, cg - gBaseline);
-    const assistsContrib = Math.max(0, ca - aBaseline);
-
-    const mergedSeasonSlice = {
-        ...prevSeas,
-        challengeGoalsBaseline: gBaseline,
-        challengeAssistsBaseline: aBaseline,
-        challengeSeasonGoals: goalsContrib,
-        challengeSeasonAssists: assistsContrib
-    };
-
-    let seasonsOut;
-    if (Array.isArray(src)) {
-        seasonsOut = [...src];
-        while (seasonsOut.length <= sn) seasonsOut.push(null);
-        const existing = seasonsOut[sn] && typeof seasonsOut[sn] === 'object' ? seasonsOut[sn] : {};
-        seasonsOut[sn] = { ...existing, ...mergedSeasonSlice };
-    } else if (src && typeof src === 'object') {
-        seasonsOut = { ...src };
-        const prior = seasonsOut[sk] !== undefined ? seasonsOut[sk] : seasonsOut[sn];
-        const existing = prior && typeof prior === 'object' ? prior : {};
-        seasonsOut[sk] = { ...existing, ...mergedSeasonSlice };
-    } else {
-        seasonsOut = { [sk]: mergedSeasonSlice };
-    }
-
-    return {
-        challengePatch: {
-            seasons: seasonsOut,
-            playfabCareerGoals: cg,
-            playfabCareerAssists: ca
-        },
-        goalsContrib,
-        assistsContrib,
-        challengeApplied: true,
-        careerGoals: cg,
-        careerAssists: ca,
-        firstAnchor
-    };
-}
-
-function isChallengeSeasonDirty(prevSeasonObj, nextSeasonObj) {
-    if (!nextSeasonObj) return false;
-    if (!prevSeasonObj) return true;
-    return (
-        prevSeasonObj.challengeGoalsBaseline !== nextSeasonObj.challengeGoalsBaseline ||
-        prevSeasonObj.challengeAssistsBaseline !== nextSeasonObj.challengeAssistsBaseline ||
-        prevSeasonObj.challengeSeasonGoals !== nextSeasonObj.challengeSeasonGoals ||
-        prevSeasonObj.challengeSeasonAssists !== nextSeasonObj.challengeSeasonAssists
-    );
-}
-
-/** RTDB: season bucket as object key "9" / 9, or legacy array seasons[seasonNum] */
-function getSeasonEntryFromPlayer(playerData, seasonNum) {
-    const seasons = playerData?.seasons;
-    if (!seasons || typeof seasons !== 'object') return {};
-    const sn = parseInt(String(seasonNum), 10);
-    if (Array.isArray(seasons)) {
-        const raw = seasons[sn];
-        return raw && typeof raw === 'object' ? { ...raw } : {};
-    }
-    const sk = String(seasonNum);
-    const raw = seasons[sk] !== undefined ? seasons[sk] : seasons[seasonNum];
-    return raw && typeof raw === 'object' ? { ...raw } : {};
-}
-
-function getSeasonBucketFromPatchSeasons(seasonsVal, seasonNum) {
-    if (!seasonsVal || typeof seasonsVal !== 'object') return undefined;
-    const sn = parseInt(String(seasonNum), 10);
-    if (Array.isArray(seasonsVal)) return seasonsVal[sn];
-    const sk = String(seasonNum);
-    return seasonsVal[sk] !== undefined ? seasonsVal[sk] : seasonsVal[seasonNum];
 }
 
 /**
@@ -371,7 +263,8 @@ async function getPlayFabPlayerStatistics(playfabId, statisticNames = ['Trophies
 
 /**
  * Fetches player data from PlayFab and updates Firebase for all club players
- * (names, trophies, PLAYER_JSON career stats, club challenges). Runs on every job invocation.
+ * Updates player names and trophy counts from PlayFab
+ * Respects sync interval to avoid excessive API calls
  */
 async function syncPlayFabPlayerData() {
     if (!PLAYFAB_ENABLED) {
@@ -379,15 +272,26 @@ async function syncPlayFabPlayerData() {
         return;
     }
 
+    // Check if enough time has passed since last sync
+    const syncIntervalMs = PLAYFAB_CONFIG.syncIntervalHours * 60 * 60 * 1000;
     const lastSyncSnapshot = await database.ref('config/lastPlayFabSync').once('value');
     const lastSyncTime = lastSyncSnapshot.val();
+    
     if (lastSyncTime) {
-        const hoursAgo = ((Date.now() - new Date(lastSyncTime).getTime()) / (1000 * 60 * 60)).toFixed(1);
-        console.log(`🔄 Starting PlayFab player data sync (previous run ${hoursAgo}h ago)...`);
+        const lastSyncDate = new Date(lastSyncTime);
+        const timeSinceLastSync = Date.now() - lastSyncDate.getTime();
+        const hoursAgo = (timeSinceLastSync / (1000 * 60 * 60)).toFixed(1);
+        
+        if (timeSinceLastSync < syncIntervalMs) {
+            const hoursRemaining = ((syncIntervalMs - timeSinceLastSync) / (1000 * 60 * 60)).toFixed(1);
+            console.log(`⏭️ PlayFab sync skipped (last sync was ${hoursAgo}h ago, next sync in ${hoursRemaining}h)`);
+            return;
+        }
+        console.log(`🔄 Starting PlayFab player data sync (last sync was ${hoursAgo}h ago)...`);
     } else {
-        console.log('🔄 Starting PlayFab player data sync (no prior lastPlayFabSync in config)...');
+        console.log('🔄 Starting PlayFab player data sync (first time)...');
     }
-
+    
     try {
         const clubSnapshot = await database.ref('clubs').once('value');
         const clubs = clubSnapshot.val() || {};
@@ -408,33 +312,6 @@ async function syncPlayFabPlayerData() {
         
         const totalPlayers = allPlayers.length;
         console.log(`  Found ${totalPlayers} players to sync...`);
-        console.log('  Challenge "seasonΔ" = PLAYFAB career goals/assists minus this season\'s baseline. The first hub sync for a player (or new season) sets baseline = current career, so seasonΔ is 0 until they earn more ranked goals/assists; club bar is the sum of all members\' seasonΔ.');
-
-        let milestonesConfig = DEFAULT_CLUB_CHALLENGE_MILESTONES;
-        try {
-            const mileSnap = await database.ref('settings/clubChallengeMilestones').once('value');
-            if (!mileSnap.exists()) {
-                await database.ref('settings/clubChallengeMilestones').set(DEFAULT_CLUB_CHALLENGE_MILESTONES);
-                milestonesConfig = DEFAULT_CLUB_CHALLENGE_MILESTONES;
-            } else {
-                const m = mileSnap.val();
-                if (m && typeof m === 'object') {
-                    milestonesConfig = {
-                        goals: Array.isArray(m.goals) && m.goals.length ? m.goals.map(Number).filter(n => Number.isFinite(n) && n > 0) : DEFAULT_CLUB_CHALLENGE_MILESTONES.goals,
-                        assists: Array.isArray(m.assists) && m.assists.length ? m.assists.map(Number).filter(n => Number.isFinite(n) && n > 0) : DEFAULT_CLUB_CHALLENGE_MILESTONES.assists
-                    };
-                }
-            }
-        } catch (e) {
-            console.warn('Could not read settings/clubChallengeMilestones, using defaults:', e.message);
-        }
-
-        const clubChallengeAccum = {};
-        for (const [cid, cdata] of Object.entries(clubs)) {
-            if (cdata.players && Object.keys(cdata.players).length > 0) {
-                clubChallengeAccum[cid] = { goals: 0, assists: 0 };
-            }
-        }
         
         // Process players in parallel batches for speed
         const BATCH_SIZE = 10; // Process 10 players at a time
@@ -447,6 +324,7 @@ async function syncPlayFabPlayerData() {
                 batch.map(async ({ clubId, playerKey, playerData }) => {
                     const normalizedId = playerData.playfabId.toUpperCase().replace(/\s/g, '');
                     
+                    // Fetch profile and statistics in parallel
                     const [profile, statistics] = await Promise.all([
                         getPlayFabPlayerProfile(normalizedId),
                         getPlayFabPlayerStatistics(normalizedId, ['NUM_TROPHIES_SEASON'])
@@ -455,51 +333,33 @@ async function syncPlayFabPlayerData() {
                     let hasUpdates = false;
                     const playerUpdates = {};
 
+                    // Update display name if available and different
                     if (profile?.DisplayName && profile.DisplayName !== playerData.name) {
                         playerUpdates.name = profile.DisplayName;
                         hasUpdates = true;
                     }
 
+                    // Update trophy count if available (statistic is named NUM_TROPHIES_SEASON in PlayFab)
+                    // Always include trophy count so we can sync to global players table
                     if (statistics?.NUM_TROPHIES_SEASON !== undefined) {
                         const newTrophyCount = statistics.NUM_TROPHIES_SEASON;
                         playerUpdates.trophyCount = newTrophyCount;
+                        // Only mark hasUpdates for club if value changed (avoid unnecessary club writes)
                         if (newTrophyCount !== playerData.trophyCount) {
                             hasUpdates = true;
                         }
                     }
 
-                    const ch = buildChallengeSeasonPatch(playerData, profile, currentSeason);
-                    let writeChallenge = false;
-                    if (ch.challengeApplied && ch.challengePatch) {
-                        const prevS = getSeasonEntryFromPlayer(playerData, currentSeason);
-                        const nextS = getSeasonBucketFromPatchSeasons(ch.challengePatch.seasons, currentSeason);
-                        writeChallenge = isChallengeSeasonDirty(prevS, nextS) ||
-                            playerData.playfabCareerGoals !== ch.challengePatch.playfabCareerGoals ||
-                            playerData.playfabCareerAssists !== ch.challengePatch.playfabCareerAssists;
-                        if (clubChallengeAccum[clubId]) {
-                            clubChallengeAccum[clubId].goals += ch.goalsContrib;
-                            clubChallengeAccum[clubId].assists += ch.assistsContrib;
-                        }
-                    }
-
-                    return {
-                        clubId,
-                        playerKey,
-                        playerData,
-                        normalizedId,
-                        playerUpdates,
-                        hasUpdates,
-                        ch,
-                        writeChallenge
-                    };
+                    return { clubId, playerKey, playerData, normalizedId, playerUpdates, hasUpdates };
                 })
             );
             
             // Process batch results
             for (const result of batchResults) {
                 if (result.status === 'fulfilled') {
-                    const { clubId, playerKey, playerData, normalizedId, playerUpdates, hasUpdates, ch, writeChallenge } = result.value;
+                    const { clubId, playerKey, playerData, normalizedId, playerUpdates, hasUpdates } = result.value;
                     
+                    // Always update global players table if we have trophy data (even if club data unchanged)
                     if (playerUpdates.trophyCount !== undefined) {
                         updates[`players/${normalizedId}/trophyCount`] = playerUpdates.trophyCount;
                         updates[`players/${normalizedId}/seasons/${currentSeason}/trophyCount`] = playerUpdates.trophyCount;
@@ -507,35 +367,17 @@ async function syncPlayFabPlayerData() {
                     if (playerUpdates.name) {
                         updates[`players/${normalizedId}/name`] = playerUpdates.name;
                     }
-
-                    if (ch.challengeApplied && ch.challengePatch) {
-                        updates[`players/${normalizedId}/playfabCareerGoals`] = ch.challengePatch.playfabCareerGoals;
-                        updates[`players/${normalizedId}/playfabCareerAssists`] = ch.challengePatch.playfabCareerAssists;
-                        updates[`players/${normalizedId}/seasons/${currentSeason}/challengeSeasonGoals`] = ch.goalsContrib;
-                        updates[`players/${normalizedId}/seasons/${currentSeason}/challengeSeasonAssists`] = ch.assistsContrib;
-                    }
-
-                    const shouldWriteClubPlayer = hasUpdates || writeChallenge;
-                    if (shouldWriteClubPlayer) {
-                        const merged = {
+                    
+                    if (hasUpdates) {
+                        // Queue updates for club player data (only if changed)
+                        updates[`clubs/${clubId}/players/${playerKey}`] = {
                             ...playerData,
                             ...playerUpdates,
-                            ...(ch.challengeApplied && ch.challengePatch ? ch.challengePatch : {}),
                             lastPlayFabSync: new Date().toISOString()
                         };
-                        updates[`clubs/${clubId}/players/${playerKey}`] = merged;
-
+                        
                         updatedPlayers++;
-                        const parts = [];
-                        if (playerUpdates.name) parts.push(`name="${playerUpdates.name}"`);
-                        if (playerUpdates.trophyCount !== undefined) parts.push(`trophies=${playerUpdates.trophyCount}`);
-                        if (writeChallenge) {
-                            const anchorNote = ch.firstAnchor ? 'first-anchor' : 'baseline';
-                            parts.push(
-                                `challenges PLAYFAB career goals=${ch.careerGoals} assists=${ch.careerAssists} | seasonΔ goals=${ch.goalsContrib} assists=${ch.assistsContrib} (${anchorNote})`
-                            );
-                        }
-                        console.log(`  ✓ ${normalizedId}: ${parts.join(' ')}`.trim() || `  ✓ ${normalizedId}: (sync)`);
+                        console.log(`  ✓ ${normalizedId}: ${playerUpdates.name ? `name="${playerUpdates.name}"` : ''} ${playerUpdates.trophyCount !== undefined ? `trophies=${playerUpdates.trophyCount}` : ''}`);
                     }
                 } else {
                     console.error(`  ✗ Failed to sync player: ${result.reason?.message || 'Unknown error'}`);
@@ -547,16 +389,6 @@ async function syncPlayFabPlayerData() {
             if (i + BATCH_SIZE < allPlayers.length) {
                 await new Promise(resolve => setTimeout(resolve, 200));
             }
-        }
-
-        console.log('⚽ Club challenge rollups (pooled season totals)...');
-        for (const [clubId, sums] of Object.entries(clubChallengeAccum)) {
-            updates[`clubs/${clubId}/seasons/${currentSeason}/challengeClubGoals`] = sums.goals;
-            updates[`clubs/${clubId}/seasons/${currentSeason}/challengeClubAssists`] = sums.assists;
-            const nm = clubs[clubId]?.name || clubId;
-            const maxG = [...milestonesConfig.goals].filter(t => sums.goals >= t).pop();
-            const maxA = [...milestonesConfig.assists].filter(t => sums.assists >= t).pop();
-            console.log(`  ${nm}: pooled goals=${sums.goals}${maxG !== undefined ? ` (tier ≥${maxG})` : ''}, assists=${sums.assists}${maxA !== undefined ? ` (tier ≥${maxA})` : ''}`);
         }
 
         // Apply all updates in a single batch
@@ -621,9 +453,9 @@ async function syncPlayFabPlayerData() {
         
         console.log(`✅ Club trophies updated: ${clubsUpdated} clubs`);
         
-        // Save the last successful sync timestamp (for logs / ops; sync is not interval-gated)
+        // Save the last sync timestamp
         await database.ref('config/lastPlayFabSync').set(new Date().toISOString());
-        console.log('📅 config/lastPlayFabSync updated');
+        console.log(`📅 Next PlayFab sync available in ${PLAYFAB_CONFIG.syncIntervalHours} hours`);
         
     } catch (error) {
         console.error('Error during PlayFab sync:', error);
