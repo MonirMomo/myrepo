@@ -184,6 +184,38 @@ function parsePlayerJsonCareerInt(val) {
 }
 
 /**
+ * RTDB update() rejects undefined anywhere in the payload (e.g. sparse seasons[] or optional fields).
+ * Prefer JSON round-trip so sparse arrays, nested undefined, etc. match Firebase validation.
+ */
+function sanitizeForFirebaseUpdate(value) {
+    if (value === undefined) return null;
+    try {
+        const json = JSON.stringify(value, (_k, v) => (v === undefined ? null : v));
+        return JSON.parse(json);
+    } catch (_err) {
+        return sanitizeForFirebaseUpdateManual(value);
+    }
+}
+
+function sanitizeForFirebaseUpdateManual(value) {
+    if (value === undefined) return null;
+    if (value === null) return null;
+    if (typeof value !== 'object') return value;
+    if (Array.isArray(value)) {
+        const result = [];
+        for (let i = 0; i < value.length; i++) {
+            result[i] = sanitizeForFirebaseUpdateManual(value[i]);
+        }
+        return result;
+    }
+    const out = {};
+    for (const key of Object.keys(value)) {
+        out[key] = sanitizeForFirebaseUpdateManual(value[key]);
+    }
+    return out;
+}
+
+/**
  * Fetches PLAYER_JSON from PlayFab Server API: username, career ranked goals (totalPoints), assists (totalAssists).
  * @param {string} playfabId - The player's PlayFab ID
  * @returns {{ displayName: string|null, careerGoals: number|null, careerAssists: number|null, diag: Object }}
@@ -680,7 +712,9 @@ async function syncPlayFabPlayerData() {
             try {
                 for (let i = 0; i < updateEntries.length; i += batchSize) {
                     const batch = updateEntries.slice(i, i + batchSize);
-                    const batchUpdates = Object.fromEntries(batch);
+                    const batchUpdates = Object.fromEntries(
+                        batch.map(([path, val]) => [path, sanitizeForFirebaseUpdate(val)])
+                    );
                     await database.ref().update(batchUpdates);
                 }
                 console.log(`  Firebase ref.update(): OK (${updateEntries.length} paths in ${Math.ceil(updateEntries.length / batchSize)} chunk(s))`);
@@ -737,7 +771,10 @@ async function syncPlayFabPlayerData() {
         
         // Apply club trophy updates
         if (Object.keys(clubTrophyUpdates).length > 0) {
-            await database.ref().update(clubTrophyUpdates);
+            const sanitizedTrophies = Object.fromEntries(
+                Object.entries(clubTrophyUpdates).map(([p, v]) => [p, sanitizeForFirebaseUpdate(v)])
+            );
+            await database.ref().update(sanitizedTrophies);
         }
         
         console.log(`✅ Club trophies updated: ${clubsUpdated} clubs`);
