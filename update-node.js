@@ -203,7 +203,7 @@ const DEFAULT_CLUB_CHALLENGE_BAG_REWARDS_ASSISTS = [
  * TESTING: use [] to grant bags to every roster member again.
  * When non-empty, only these PlayFab IDs receive PlayFab increments (normalized uppercase).
  */
-const CLUB_CHALLENGE_BAG_TEST_ONLY_PLAYFAB_IDS = ['41FCED8D2DB8D250', '151D23D7FC1C073A'];
+const CLUB_CHALLENGE_BAG_TEST_ONLY_PLAYFAB_IDS = [];
 
 function parsePlayerJsonCareerInt(val) {
     if (val === undefined || val === null) return null;
@@ -249,6 +249,92 @@ function parsePlayerJsonOpenBagInt(val) {
     return Number.isFinite(n) && n >= 0 ? n : 0;
 }
 
+/** Refuse bag writes if PLAYER_JSON does not look like a full game blob (prevents `{}` / truncated writes). */
+const PLAYER_JSON_MIN_TOP_LEVEL_KEYS = 24;
+const PLAYER_JSON_ABSOLUTE_MIN_SERIALIZED_LENGTH = 400;
+const PLAYER_JSON_MIN_SERIALIZED_LENGTH_RATIO = 0.75;
+
+function validatePlayerJsonBeforeBagMutation(originalString, parsedObj) {
+    if (typeof originalString !== 'string') {
+        return { ok: false, error: 'PLAYER_JSON Value is not a string' };
+    }
+    if (originalString.length < PLAYER_JSON_ABSOLUTE_MIN_SERIALIZED_LENGTH) {
+        return {
+            ok: false,
+            error: `incoming PLAYER_JSON too short (${originalString.length} chars, min ${PLAYER_JSON_ABSOLUTE_MIN_SERIALIZED_LENGTH})`
+        };
+    }
+    if (typeof parsedObj !== 'object' || parsedObj === null || Array.isArray(parsedObj)) {
+        return { ok: false, error: 'parsed PLAYER_JSON is not a plain object' };
+    }
+    const nKeys = Object.keys(parsedObj).length;
+    if (nKeys < PLAYER_JSON_MIN_TOP_LEVEL_KEYS) {
+        return {
+            ok: false,
+            error: `parsed PLAYER_JSON has only ${nKeys} top-level keys (min ${PLAYER_JSON_MIN_TOP_LEVEL_KEYS})`
+        };
+    }
+    return { ok: true };
+}
+
+function validateSerializedPlayerJsonAfterMutation(originalString, newString) {
+    if (typeof newString !== 'string') {
+        return { ok: false, error: 'serialized PLAYER_JSON is not a string' };
+    }
+    if (newString.length < PLAYER_JSON_ABSOLUTE_MIN_SERIALIZED_LENGTH) {
+        return {
+            ok: false,
+            error: `post-edit PLAYER_JSON too short (${newString.length} chars, min ${PLAYER_JSON_ABSOLUTE_MIN_SERIALIZED_LENGTH})`
+        };
+    }
+    const ratio = newString.length / originalString.length;
+    if (ratio < PLAYER_JSON_MIN_SERIALIZED_LENGTH_RATIO) {
+        return {
+            ok: false,
+            error: `post-edit PLAYER_JSON length ${(ratio * 100).toFixed(1)}% of original (min ${PLAYER_JSON_MIN_SERIALIZED_LENGTH_RATIO * 100}%)`
+        };
+    }
+    try {
+        JSON.parse(newString);
+    } catch (e) {
+        return { ok: false, error: `post-edit JSON invalid: ${e.message}` };
+    }
+    return { ok: true };
+}
+
+function normalizePlayFabIdForStorage(playfabId) {
+    return String(playfabId || '').toUpperCase().replace(/\s/g, '');
+}
+
+/**
+ * The first time we actually increment pending bags in PlayFab for a player, store their pre-mutation
+ * PLAYER_JSON string in RTDB (one snapshot per PlayFab ID, never overwritten). Skipped for dry runs.
+ * Path: playerJsonBagBackupBeforeFirstGrant/{normalizedPlayFabId}
+ */
+async function saveFirstBagGrantPlayerJsonBackup(playfabId, originalJsonString) {
+    const id = normalizePlayFabIdForStorage(playfabId);
+    if (!id || typeof originalJsonString !== 'string') return { ok: false, skipped: true };
+
+    try {
+        const ref = database.ref(`playerJsonBagBackupBeforeFirstGrant/${id}`);
+        const tx = await ref.transaction((current) => {
+            if (current != null) {
+                return current;
+            }
+            return {
+                savedAt: admin.database.ServerValue.TIMESTAMP,
+                playFabId: id,
+                /** Full PlayFab USER PLAYER_JSON.Value before any hub bag increment */
+                playerJson: originalJsonString
+            };
+        });
+        return { ok: true, committed: !!tx.committed };
+    } catch (err) {
+        console.warn(`  ⚠️ First-time PLAYER_JSON backup failed for ${id}: ${err.message}`);
+        return { ok: false, error: err.message };
+    }
+}
+
 /** Season bucket on a club document (array or keyed object), same layout as players */
 function getSeasonBucketFromClub(clubData, seasonNum) {
     const seasons = clubData?.seasons;
@@ -282,12 +368,16 @@ function normalizeBagRewardsFromSettings(arr, fallbackTiers) {
 
 /**
  * Increment PlayFab USER PLAYER_JSON open_allStarBag / open_mvpBag (mirrors GiveRewards pending inventory).
+ * Set env SKIP_PLAYFAB_BAG_WRITES=1 to log-only (no UpdateUserData) for cron dry runs.
  */
 async function incrementPlayFabOpenBags(playfabId, allStarDelta, mvpDelta) {
     if (!PLAYFAB_ENABLED) return { ok: false, error: 'playfab_disabled' };
     const asd = allStarDelta || 0;
     const md = mvpDelta || 0;
     if (asd <= 0 && md <= 0) return { ok: true, skipped: true };
+
+    const bagDryRun =
+        process.env.SKIP_PLAYFAB_BAG_WRITES === '1' || process.env.PLAYFAB_BAG_DRY_RUN === '1';
 
     try {
         const getRes = await fetch(getPlayFabUrl('/Server/GetUserData'), {
@@ -308,14 +398,44 @@ async function incrementPlayFabOpenBags(playfabId, allStarDelta, mvpDelta) {
         if (getBody.code !== 200 || !getBody.data?.Data?.PLAYER_JSON?.Value) {
             return { ok: false, error: getBody.errorMessage || 'no PLAYER_JSON user data' };
         }
+        const originalJsonString = getBody.data.Data.PLAYER_JSON.Value;
         let pj;
         try {
-            pj = JSON.parse(getBody.data.Data.PLAYER_JSON.Value);
+            pj = JSON.parse(originalJsonString);
         } catch (e) {
             return { ok: false, error: `PLAYER_JSON parse: ${e.message}` };
         }
+
+        const pre = validatePlayerJsonBeforeBagMutation(originalJsonString, pj);
+        if (!pre.ok) {
+            return { ok: false, error: `safety: ${pre.error}` };
+        }
+
+        if (!bagDryRun) {
+            await saveFirstBagGrantPlayerJsonBackup(playfabId, originalJsonString);
+        }
+
         pj.open_allStarBag = parsePlayerJsonOpenBagInt(pj.open_allStarBag) + asd;
         pj.open_mvpBag = parsePlayerJsonOpenBagInt(pj.open_mvpBag) + md;
+
+        let newJsonString;
+        try {
+            newJsonString = JSON.stringify(pj);
+        } catch (e) {
+            return { ok: false, error: `PLAYER_JSON stringify: ${e.message}` };
+        }
+
+        const post = validateSerializedPlayerJsonAfterMutation(originalJsonString, newJsonString);
+        if (!post.ok) {
+            return { ok: false, error: `safety: ${post.error}` };
+        }
+
+        if (bagDryRun) {
+            console.log(
+                `  [PLAYFAB_BAG_DRY_RUN] would write ${playfabId} (+${asd} all-star, +${md} mvp pending); payload ${newJsonString.length} chars`
+            );
+            return { ok: true, skipped: true, dryRun: true };
+        }
 
         const putRes = await fetch(getPlayFabUrl('/Server/UpdateUserData'), {
             method: 'POST',
@@ -326,7 +446,7 @@ async function incrementPlayFabOpenBags(playfabId, allStarDelta, mvpDelta) {
             body: JSON.stringify({
                 PlayFabId: playfabId,
                 Data: {
-                    PLAYER_JSON: JSON.stringify(pj)
+                    PLAYER_JSON: newJsonString
                 },
                 Permission: 'Public'
             })
@@ -390,7 +510,6 @@ async function grantClubChallengeBagRewardsOneTrack({
 
             grantTargets++;
             const r = await incrementPlayFabOpenBags(pid, addAs, addMvp);
-            playfabWrites++;
             if (!r.ok) {
                 tierOk = false;
                 console.error(
@@ -398,6 +517,14 @@ async function grantClubChallengeBagRewardsOneTrack({
                 );
                 break;
             }
+            if (r.dryRun) {
+                tierOk = false;
+                console.log(
+                    `  🎁 PLAYFAB_BAG_DRY_RUN: no PlayFab write / no tier claim (${axisLabel} tier ${tierIdx}, ${clubData.name || clubId}, ${pid})`
+                );
+                break;
+            }
+            playfabWrites++;
             await new Promise((resolve) => setTimeout(resolve, 35));
         }
 
