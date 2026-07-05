@@ -114,7 +114,7 @@ const API_CONFIG = {
     accessToken: process.env.API_ACCESS_TOKEN || '',
     appId: process.env.API_APP_ID || '',
     baseUrl: process.env.API_BASE_URL || 'https://backbone-client-api.azurewebsites.net/api/v1',
-    tournamentsDays: parseInt(process.env.TOURNAMENTS_DAYS) || 1 // How many days back to fetch tournaments
+    tournamentsDays: 4// How many days back to fetch tournaments
 };
 
 // PlayFab Configuration - For fetching player profiles and statistics
