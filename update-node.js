@@ -292,6 +292,15 @@ function clubChallengeRewardTierHasGrants(reward) {
     return Object.keys(items).length > 0;
 }
 
+function multiplyClubChallengeRewardItems(items, multiplier = 3) {
+    const out = {};
+    for (const [itemId, qty] of Object.entries(items || {})) {
+        const n = Math.max(0, parseInt(String(qty), 10) || 0);
+        if (n > 0) out[itemId] = n * multiplier;
+    }
+    return out;
+}
+
 function formatClubChallengeRewardTierForLog(reward) {
     const { items } = normalizeClubChallengeRewardTier(reward);
     const parts = Object.entries(items).map(([id, qty]) => `${id}×${qty}`);
@@ -398,7 +407,8 @@ async function grantClubChallengeBagRewardsOneTrack({
     seasonBucket,
     currentSeason,
     updates,
-    testOnlySet
+    testOnlySet,
+    playerSubscriptionsByPlayfabId
 }) {
     const nTiers = Math.min(milestoneArr.length, rewardsTiers.length);
     if (nTiers <= 0) return { tiersGranted: 0, playfabWrites: 0 };
@@ -427,8 +437,16 @@ async function grantClubChallengeBagRewardsOneTrack({
             const pid = String(playerData.playfabId).toUpperCase().replace(/\s/g, '');
             if (testOnlySet.size > 0 && !testOnlySet.has(pid)) continue;
 
+            const isPro = playerSubscriptionsByPlayfabId?.[pid] === 'pro';
+            const grantItems = isPro
+                ? {
+                      ...multiplyClubChallengeRewardItems(tierItems, 2),
+                      gold: 1,
+                      upgradePoints: 1
+                  }
+                : tierItems;
             grantTargets++;
-            const r = await grantPlayFabInventoryItems(pid, tierItems);
+            const r = await grantPlayFabInventoryItems(pid, grantItems);
             if (!r.ok) {
                 tierOk = false;
                 console.error(
@@ -461,8 +479,10 @@ async function grantClubChallengeBagRewardsOneTrack({
                 testOnlySet.size > 0
                     ? `${grantTargets} test account(s) (roster has ${memberEntries.length})`
                     : `${memberEntries.length} member(s)`;
+            const grantSummary = formatClubChallengeRewardTierForLog(reward);
+            const tierSummary = grantSummary + (playerSubscriptionsByPlayfabId?.[String(Object.values(clubData.players || {})[0]?.playfabId || '').toUpperCase().replace(/\s/g, '')] === 'pro' ? ' ×2 + bonus gold/strength (Pro subscribers)' : '');
             console.log(
-                `  🎁 "${clubData.name || clubId}" [${axisLabel}] tier ${tierIdx + 1}/${nTiers} (pooled≥${milestoneArr[tierIdx]}) → ${formatClubChallengeRewardTierForLog(reward)} × ${rosterNote}`
+                `  🎁 "${clubData.name || clubId}" [${axisLabel}] tier ${tierIdx + 1}/${nTiers} (pooled≥${milestoneArr[tierIdx]}) → ${tierSummary} × ${rosterNote}`
             );
         }
     }
@@ -508,6 +528,13 @@ async function grantClubChallengeBagRewards({
             .map((id) => String(id || '').toUpperCase().replace(/\s/g, ''))
             .filter(Boolean)
     );
+    const playersRootSnap = await database.ref('players').once('value');
+    const playersRoot = playersRootSnap.val() || {};
+    const playerSubscriptionsByPlayfabId = {};
+    for (const [playfabId, playerData] of Object.entries(playersRoot)) {
+        const normalizedId = normalizePlayFabIdForStorage(playfabId);
+        playerSubscriptionsByPlayfabId[normalizedId] = playerData?.subscription?.level === 'pro' ? 'pro' : 'free';
+    }
     if (testOnlySet.size > 0) {
         console.log(
             `  🎁 TEST MODE: PlayFab bag grants only for [${[...testOnlySet].join(', ')}] (set CLUB_CHALLENGE_BAG_TEST_ONLY_PLAYFAB_IDS to [] for full roster)`
@@ -537,7 +564,8 @@ async function grantClubChallengeBagRewards({
             seasonBucket,
             currentSeason,
             updates,
-            testOnlySet
+            testOnlySet,
+            playerSubscriptionsByPlayfabId
         });
         tiersNewlyGranted += gRes.tiersGranted;
         playfabWrites += gRes.playfabWrites;
@@ -553,7 +581,8 @@ async function grantClubChallengeBagRewards({
             seasonBucket,
             currentSeason,
             updates,
-            testOnlySet
+            testOnlySet,
+            playerSubscriptionsByPlayfabId
         });
         tiersNewlyGranted += aRes.tiersGranted;
         playfabWrites += aRes.playfabWrites;
