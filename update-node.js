@@ -1,5 +1,5 @@
 /**
- * Tournament Data Update System - Node.js Version
+ * Tournament Data Update System - Node.js Version.
  * Fetches tournament data from external API and updates Firebase database
  * with player and club statistics, points, and tournament results
  */
