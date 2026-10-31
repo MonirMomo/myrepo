@@ -1,5 +1,5 @@
 /**
- * Tournament Data Update System - Node.js Version.
+ * Tournament Data Update System - Node.js Version
  * Fetches tournament data from external API and updates Firebase database
  * with player and club statistics, points, and tournament results
  */
@@ -1537,17 +1537,14 @@ function getTierFromName(name) {
     if (normalizedName.includes('silver') && normalizedName.includes('india')) {
         return 'silverAsia2';
     }
-    if (normalizedName.includes('silver') && normalizedName.includes('eu') && normalizedName.includes('1')) {
+    if (normalizedName.includes('silver') && normalizedName.includes('eu') && !normalizedName.includes('2')) {
         return 'silverEu1';
     }
     if (normalizedName.includes('silver') && normalizedName.includes('eu') && normalizedName.includes('2')) {
         return 'silverEu2';
     }
-    if (normalizedName.includes('silver') && (normalizedName.includes('us') || normalizedName.includes('br')) && normalizedName.includes('1')) {
+    if (normalizedName.includes('silver') && normalizedName.includes('us') && !normalizedName.includes('2')) {
         return 'silverUs1';
-    }
-    if (normalizedName.includes('silver') && (normalizedName.includes('us') || normalizedName.includes('br')) && normalizedName.includes('2')) {
-        return 'silverUs2';
     }
     
     // Special tournaments
@@ -1933,21 +1930,20 @@ function displayTop4Teams(sortedTeams, tournamentName, players) {
  */
 function getPointsMapping(tier) {
     const pointsMap = {
-        diamond: [36, 18, 9, 9],
-        platinum: [18, 9, 4.5, 4.5],
+        diamond: [40, 20, 10, 10],
+        platinum: [20, 10, 5, 5],
         goldLimited: [6, 3, 1.5, 1.5],
-        gold: [5, 2.5, 1.2, 1.2],
-        silverEu2: [2, 1, 0.5, 0.5],
-        silverEu1: [1.6, 0.8, 0.4, 0.4],
-        silverUs1: [1.4, 0.7, 0.3, 0.3],
-        asia: [1.6, 0.8, 0.4, 0.4],
+        gold: [6, 3, 1.2, 1.2],
+        silverEu2: [2.2, 0.9, 0.4, 0.4],
+        silverEu1: [1.8, 0.7, 0.3, 0.3],
+        silverUs1: [1.8, 0.7, 0.3, 0.3],
+        asia: [2, 0.8, 0.3, 0.3],
         america: [2, 1, 0.5, 0.5],
-        silverUs2: [1.2, 0.6, 0.3, 0.3],
-        silverAsia1: [1, 0.5, 0.2, 0.2],
-        silverAsia2: [1, 0.5, 0.2, 0.2],
-        roundMadnessEu: [10, 5, 2.5, 1.7],
-        roundMadnessUs: [7, 3.5, 1.7, 1.2],
-        roundMadnessIndia: [6.4, 3.2, 1.6, 1.1],
+        silverAsia1: [1, 0.4, 0, 0],
+        silverAsia2: [1, 0.4, 0, 0],
+        roundMadnessEu: [11, 6.5, 2.6, 2],
+        roundMadnessUs: [7.6, 3.8, 1.5, 1.1],
+        roundMadnessIndia: [7, 3.5, 1.4, 1],
         halloweenCup: [10, 5, 2.5, 2.5],
         championship: [60, 30, 15, 15],
         Unknown: [0, 0, 0, 0]
